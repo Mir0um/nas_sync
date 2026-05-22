@@ -161,6 +161,13 @@ def get_mtime(p: Path) -> float:
         return 0.0
 
 
+def get_size(p: Path) -> int:
+    try:
+        return p.stat().st_size
+    except Exception:
+        return 0
+
+
 def notify(summary: str, body: str = ""):
     if not cfg.get("notifications", True):
         return
@@ -448,25 +455,35 @@ def do_sync() -> int:
     total_ops = len(to_nas) + len(to_local) + len(del_from_nas) + len(del_from_local) + len(conflicts)
     op        = 0
 
+    bytes_total = (sum(get_size(local_path(k)) for k in to_nas) +
+                   sum(get_size(nas_path(k))   for k in to_local))
+    bytes_done  = 0
+
     # ── copier local → NAS
     for key in to_nas:
         op += 1
-        write_progress("synchro", key, op, total_ops)  # fix 6
-        if safe_copy(local_path(key), nas_path(key), do_backup=do_bk):
-            new_state[key] = get_mtime(nas_path(key))  # mtime de destination
+        src        = local_path(key)
+        file_bytes = get_size(src)
+        write_progress("synchro", key, op, total_ops, bytes_done, bytes_total)
+        if safe_copy(src, nas_path(key), do_backup=do_bk):
+            new_state[key] = get_mtime(nas_path(key))
             append_event("→NAS", key)
-            changes += 1
+            changes    += 1
+            bytes_done += file_bytes
         else:
             new_state[key] = state.get(key, 0)
 
     # ── copier NAS → local
     for key in to_local:
         op += 1
-        write_progress("synchro", key, op, total_ops)
-        if safe_copy(nas_path(key), local_path(key), do_backup=do_bk):
+        src        = nas_path(key)
+        file_bytes = get_size(src)
+        write_progress("synchro", key, op, total_ops, bytes_done, bytes_total)
+        if safe_copy(src, local_path(key), do_backup=do_bk):
             new_state[key] = get_mtime(local_path(key))
             append_event("←NAS", key)
-            changes += 1
+            changes    += 1
+            bytes_done += file_bytes
         else:
             new_state[key] = state.get(key, 0)
 
@@ -541,7 +558,7 @@ def do_sync() -> int:
             append_event("conflit ignoré", key)
 
     save_state(new_state)
-    write_progress("idle", "", changes, total_ops)  # fix 6
+    write_progress("idle", "", changes, total_ops, bytes_done, bytes_total)
 
     min_notif = cfg.get("notif_min_files", 1)
     if changes >= min_notif:

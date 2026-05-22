@@ -38,6 +38,75 @@ ICON_OFF  = "network-offline"
 REFRESH   = 4000   # ms
 
 
+def _fmt_size(n: int) -> str:
+    for unit, div in (("Go", 1_000_000_000), ("Mo", 1_000_000), ("Ko", 1_000)):
+        if n >= div:
+            return f"{n / div:.1f} {unit}"
+    return f"{n} o"
+
+
+# ── Changement de mode (portable ↔ fixe) ─────────────────────────────────────
+
+def _apply_mode_switch(new_mode: str, cfg: dict):
+    """Met à jour les liens symboliques, XDG dirs et le service selon le mode."""
+    import subprocess
+    home       = Path.home()
+    nas_mount  = Path(cfg.get("nas_mount",  str(home / "NasShare")))
+    local_base = Path(cfg.get("local_base", str(home / "offline_cache")))
+    base       = nas_mount if new_mode == "fixe" else local_base
+
+    FR_LINKS = {
+        "Desktop":   "Bureau",
+        "Downloads": "Téléchargements",
+        "Documents": "Documents",
+        "Pictures":  "Images",
+        "Music":     "Musique",
+        "video":     "Vidéos",
+    }
+    XDG_KEYS = {
+        "Desktop":   "XDG_DESKTOP_DIR",
+        "Downloads": "XDG_DOWNLOAD_DIR",
+        "Documents": "XDG_DOCUMENTS_DIR",
+        "Music":     "XDG_MUSIC_DIR",
+        "Pictures":  "XDG_PICTURES_DIR",
+        "video":     "XDG_VIDEOS_DIR",
+    }
+    enabled = {d["local_sub"] for d in cfg.get("dirs", []) if d.get("enabled", True)}
+
+    for sub, fr_name in FR_LINKS.items():
+        if sub not in enabled:
+            continue
+        target = base / sub
+        link   = home / fr_name
+        if link.is_symlink():
+            link.unlink()
+        elif link.is_dir():
+            try: link.rmdir()
+            except OSError: pass
+        try: link.symlink_to(target)
+        except OSError: pass
+
+    xdg_lines = [
+        f'{xdg}="{base}/{sub}"'
+        for sub, xdg in XDG_KEYS.items() if sub in enabled
+    ]
+    xdg_file = home / ".config" / "user-dirs.dirs"
+    try:
+        xdg_file.write_text("\n".join(xdg_lines) + "\n")
+        subprocess.run(["xdg-user-dirs-update"], capture_output=True)
+    except OSError:
+        pass
+
+    svc = "nas-sync.service"
+    if new_mode == "fixe":
+        subprocess.run(["systemctl", "--user", "stop",    svc], capture_output=True)
+        subprocess.run(["systemctl", "--user", "disable", svc], capture_output=True)
+    else:
+        local_base.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["systemctl", "--user", "enable", svc], capture_output=True)
+        subprocess.run(["systemctl", "--user", "start",  svc], capture_output=True)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Fenêtre — Fichiers récents   (fix 8 : auto-rafraîchissement)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -159,6 +228,7 @@ class SettingsWindow(Gtk.Window):
         nb.set_border_width(8)
         vbox.pack_start(nb, True, True, 0)
 
+        nb.append_page(self._tab_mode(),       Gtk.Label(label="  Mode  "))
         nb.append_page(self._tab_connexion(),  Gtk.Label(label="  Connexion  "))
         nb.append_page(self._tab_dossiers(),   Gtk.Label(label="  Dossiers  "))
         nb.append_page(self._tab_synchro(),    Gtk.Label(label="  Synchronisation  "))
@@ -383,6 +453,59 @@ class SettingsWindow(Gtk.Window):
 
         return self._wrap(vbox)
 
+    # ── onglet Mode ───────────────────────────────────────────────────────────
+
+    def _tab_mode(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        vbox.set_border_width(24)
+
+        title = Gtk.Label()
+        title.set_markup("<b>Mode d'utilisation</b>")
+        title.set_xalign(0)
+        vbox.pack_start(title, False, False, 0)
+
+        current = self._cfg.get("mode", "portable")
+
+        self._radio_portable = Gtk.RadioButton.new_with_label(
+            None, "PC portable — cache local + synchronisation automatique"
+        )
+        self._radio_fixe = Gtk.RadioButton.new_with_label_from_widget(
+            self._radio_portable, "PC fixe — accès direct au NAS"
+        )
+        if current == "fixe":
+            self._radio_fixe.set_active(True)
+        else:
+            self._radio_portable.set_active(True)
+
+        for radio, desc in [
+            (self._radio_portable,
+             "Vos fichiers sont copiés localement (~/offline_cache/).\n"
+             "Accessibles même sans réseau. Synchronisés automatiquement à la reconnexion."),
+            (self._radio_fixe,
+             "Vos dossiers pointent directement vers le NAS.\n"
+             "Simple et rapide. Le NAS doit être accessible en permanence.\n"
+             "La synchronisation est désactivée."),
+        ]:
+            vbox.pack_start(radio, False, False, 0)
+            lbl = Gtk.Label(label=desc)
+            lbl.set_xalign(0)
+            lbl.set_margin_start(28)
+            lbl.set_line_wrap(True)
+            vbox.pack_start(lbl, False, False, 0)
+            vbox.pack_start(Gtk.Separator(), False, False, 4)
+
+        warn = Gtk.Label()
+        warn.set_markup(
+            "<small><i>⚠  Changer de mode met à jour les liens symboliques et "
+            "reconfigure le service.\nUn redémarrage de session peut être nécessaire "
+            "pour que les dossiers soient pris en compte.</i></small>"
+        )
+        warn.set_xalign(0)
+        warn.set_line_wrap(True)
+        vbox.pack_start(warn, False, False, 0)
+
+        return self._wrap(vbox)
+
     # ── sauvegarde ────────────────────────────────────────────────────────────
 
     def _wrap(self, w):
@@ -420,14 +543,20 @@ class SettingsWindow(Gtk.Window):
         cfg["pause_on_battery"]       = self._chk_battery.get_active()
         cfg["pause_on_metered"]       = self._chk_metered.get_active()
 
+        old_mode   = self._cfg.get("mode", "portable")
+        cfg["mode"] = "fixe" if self._radio_fixe.get_active() else "portable"
+
         save_config(cfg)
 
-        pid = get_daemon_pid()
-        if pid:
-            try:
-                os.kill(pid, signal.SIGHUP)
-            except OSError:
-                pass
+        if cfg["mode"] != old_mode:
+            _apply_mode_switch(cfg["mode"], cfg)
+        else:
+            pid = get_daemon_pid()
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGHUP)
+                except OSError:
+                    pass
 
         self.destroy()
         if self._on_saved:
@@ -583,10 +712,18 @@ class NasSyncApp:
             prog   = read_progress()
             status = prog.get("status", "")
             if status == "synchro":
-                done  = prog.get("done", 0)
+                done  = prog.get("done",  0)
                 total = prog.get("total", 0)
+                bd    = prog.get("bytes_done",  0)
+                bt    = prog.get("bytes_total", 0)
                 cur   = Path(prog.get("current", "")).name
-                label = f"  En cours : {cur} ({done}/{total})" if cur else f"  En cours ({done}/{total})"
+                if bt > 0:
+                    pct   = int(bd * 100 // bt)
+                    label = (f"  {pct}% — {_fmt_size(bd)} / {_fmt_size(bt)}"
+                             f"  ({done}/{total} fichiers)")
+                else:
+                    label = (f"  En cours : {cur}  ({done}/{total})"
+                             if cur else f"  En cours ({done}/{total})")
             elif status == "pause":
                 label = "  ⏸ En pause (batterie / réseau)"
             elif status in ("idle", "arrêté", ""):

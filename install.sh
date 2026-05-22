@@ -20,6 +20,26 @@ echo "   NAS Sync — Installation"
 echo "══════════════════════════════════════════════"
 echo ""
 
+# ── Mode d'utilisation ────────────────────────────────────────────────────────
+
+echo "Mode d'utilisation :"
+echo ""
+echo "  1) PC portable  — cache local + synchronisation hors ligne (défaut)"
+echo "     Vos fichiers sont copiés localement. Accessibles même sans réseau."
+echo "     Synchronisés automatiquement dès la reconnexion au NAS."
+echo ""
+echo "  2) PC fixe      — accès direct au NAS"
+echo "     Vos dossiers pointent directement vers le NAS."
+echo "     Simple et rapide. Le NAS doit être disponible en permanence."
+echo ""
+read -rp "Votre choix [1/2, défaut=1] : " _MODE_CHOICE
+case "${_MODE_CHOICE}" in
+    2) INSTALL_MODE="fixe"     ;;
+    *) INSTALL_MODE="portable" ;;
+esac
+ok "Mode : $INSTALL_MODE"
+echo ""
+
 # ── Dépendances ───────────────────────────────────────────────────────────────
 
 echo "Vérification des dépendances…"
@@ -117,20 +137,39 @@ ok "Dossiers créés dans $LOCAL"
 
 # ── Synchro initiale NAS → local ─────────────────────────────────────────────
 
-if [ "$NAS_OK" = true ] && [ "$HAS_RSYNC" = true ]; then
+if [ "$NAS_OK" = true ] && [ "$HAS_RSYNC" = true ] && [ "$INSTALL_MODE" = "portable" ]; then
     echo ""
     echo "Synchronisation initiale NAS → cache local …"
-    # fix 11 : afficher le nombre de fichiers et les statistiques rsync
     declare -A NAS_DIRS=( [Desktop]=Desktop [Downloads]=Downloads \
         [Documents]=Documents [Music]=Music [Pictures]=Pictures [video]=video )
+
+    # Calculer la taille totale avant de commencer
+    total_bytes=0
+    for nas_sub in Desktop Downloads Documents Music Pictures video; do
+        if [ -d "$NAS/$nas_sub" ]; then
+            sz=$(du -sb "$NAS/$nas_sub" 2>/dev/null | awk '{print $1}')
+            total_bytes=$(( total_bytes + ${sz:-0} ))
+        fi
+    done
+    if [ "$total_bytes" -gt 1073741824 ]; then
+        total_human=$(awk "BEGIN{printf \"%.1f Go\", $total_bytes/1073741824}")
+    elif [ "$total_bytes" -gt 1048576 ]; then
+        total_human=$(awk "BEGIN{printf \"%.1f Mo\", $total_bytes/1048576}")
+    else
+        total_human="${total_bytes} o"
+    fi
+    echo "  Volume total à copier : $total_human"
+    echo ""
+
     for local_sub in "${!NAS_DIRS[@]}"; do
         nas_sub="${NAS_DIRS[$local_sub]}"
         if [ -d "$NAS/$nas_sub" ]; then
             nb=$(find "$NAS/$nas_sub" -type f 2>/dev/null | wc -l)
-            echo "  $nas_sub : $nb fichiers détectés…"
-            rsync -a --ignore-existing --stats \
-                "$NAS/$nas_sub/" "$LOCAL/$local_sub/" 2>/dev/null \
-                | grep -E "Number of files:|transferred:" | sed 's/^/    /' || true
+            sz=$(du -sh "$NAS/$nas_sub" 2>/dev/null | awk '{print $1}')
+            echo "  $nas_sub ($nb fichiers, $sz) :"
+            rsync -ah --ignore-existing --info=progress2 \
+                "$NAS/$nas_sub/" "$LOCAL/$local_sub/" 2>/dev/null || true
+            echo ""
             ok "$nas_sub synchronisé"
         else
             warn "$nas_sub absent sur le NAS — ignoré"
@@ -142,13 +181,18 @@ fi
 
 echo ""
 echo "Mise à jour des liens symboliques …"
+if [ "$INSTALL_MODE" = "fixe" ]; then
+    LINK_BASE="$NAS"
+else
+    LINK_BASE="$LOCAL"
+fi
 declare -A SYMLINKS=(
-    ["$HOME/Bureau"]="$LOCAL/Desktop"
-    ["$HOME/Téléchargements"]="$LOCAL/Downloads"
-    ["$HOME/Documents"]="$LOCAL/Documents"
-    ["$HOME/Musique"]="$LOCAL/Music"
-    ["$HOME/Images"]="$LOCAL/Pictures"
-    ["$HOME/Vidéos"]="$LOCAL/video"
+    ["$HOME/Bureau"]="$LINK_BASE/Desktop"
+    ["$HOME/Téléchargements"]="$LINK_BASE/Downloads"
+    ["$HOME/Documents"]="$LINK_BASE/Documents"
+    ["$HOME/Musique"]="$LINK_BASE/Music"
+    ["$HOME/Images"]="$LINK_BASE/Pictures"
+    ["$HOME/Vidéos"]="$LINK_BASE/video"
 )
 for link_path in "${!SYMLINKS[@]}"; do
     target="${SYMLINKS[$link_path]}"
@@ -166,13 +210,18 @@ done
 echo ""
 echo "Mise à jour de ~/.config/user-dirs.dirs …"
 mkdir -p "$HOME/.config"
-cat > "$HOME/.config/user-dirs.dirs" << 'EOF'
-XDG_DESKTOP_DIR="$HOME/offline_cache/Desktop"
-XDG_DOWNLOAD_DIR="$HOME/offline_cache/Downloads"
-XDG_DOCUMENTS_DIR="$HOME/offline_cache/Documents"
-XDG_MUSIC_DIR="$HOME/offline_cache/Music"
-XDG_PICTURES_DIR="$HOME/offline_cache/Pictures"
-XDG_VIDEOS_DIR="$HOME/offline_cache/video"
+if [ "$INSTALL_MODE" = "fixe" ]; then
+    XDG_BASE="\$HOME/NasShare"
+else
+    XDG_BASE="\$HOME/offline_cache"
+fi
+cat > "$HOME/.config/user-dirs.dirs" << EOF
+XDG_DESKTOP_DIR="${XDG_BASE}/Desktop"
+XDG_DOWNLOAD_DIR="${XDG_BASE}/Downloads"
+XDG_DOCUMENTS_DIR="${XDG_BASE}/Documents"
+XDG_MUSIC_DIR="${XDG_BASE}/Music"
+XDG_PICTURES_DIR="${XDG_BASE}/Pictures"
+XDG_VIDEOS_DIR="${XDG_BASE}/video"
 EOF
 xdg-user-dirs-update 2>/dev/null || true
 ok "XDG user-dirs mis à jour"
@@ -184,18 +233,30 @@ if [ ! -f "$CONFIG" ]; then
     echo "Génération de la configuration initiale…"
     PYTHONPATH="$SCRIPT_DIR" python3 - << 'PY'
 from nas_sync_config import load_config
-
 load_config()
 PY
     ok "Configuration créée : $CONFIG"
 fi
 
-# ── Service systemd ───────────────────────────────────────────────────────────
+# Enregistrer le mode dans la configuration
+python3 - << PYEOF
+import json
+from pathlib import Path
+cfg_path = Path("$CONFIG")
+if cfg_path.exists():
+    cfg = json.loads(cfg_path.read_text())
+    cfg["mode"] = "$INSTALL_MODE"
+    cfg_path.write_text(json.dumps(cfg, indent=2))
+PYEOF
+ok "Mode '$INSTALL_MODE' enregistré dans la configuration"
+
+# ── Service systemd (mode portable uniquement) ────────────────────────────────
 
 echo ""
-echo "Installation du service systemd …"
-mkdir -p "$HOME/.config/systemd/user"
-cat > "$HOME/.config/systemd/user/nas-sync.service" << EOF
+if [ "$INSTALL_MODE" = "portable" ]; then
+    echo "Installation du service systemd …"
+    mkdir -p "$HOME/.config/systemd/user"
+    cat > "$HOME/.config/systemd/user/nas-sync.service" << EOF
 [Unit]
 Description=NAS Sync Daemon — Synchronisation bidirectionnelle offline_cache ↔ Cassis.local
 After=network.target graphical-session.target
@@ -212,14 +273,16 @@ StandardError=journal
 [Install]
 WantedBy=graphical-session.target
 EOF
-
-systemctl --user daemon-reload
-systemctl --user enable nas-sync.service
-systemctl --user start nas-sync.service
-sleep 2
-systemctl --user is-active --quiet nas-sync.service \
-    && ok "Service nas-sync démarré et activé" \
-    || warn "Service démarré (vérifiez avec : systemctl --user status nas-sync)"
+    systemctl --user daemon-reload
+    systemctl --user enable nas-sync.service
+    systemctl --user start nas-sync.service
+    sleep 2
+    systemctl --user is-active --quiet nas-sync.service \
+        && ok "Service nas-sync démarré et activé" \
+        || warn "Service démarré (vérifiez avec : systemctl --user status nas-sync)"
+else
+    ok "Mode PC fixe — service de synchronisation non activé"
+fi
 
 # ── Autostart GNOME pour l'interface ─────────────────────────────────────────
 
@@ -252,21 +315,32 @@ echo "════════════════════════�
 echo "   Installation terminée !"
 echo "══════════════════════════════════════════════"
 echo ""
+echo "  Mode            : $INSTALL_MODE"
+if [ "$INSTALL_MODE" = "portable" ]; then
 echo "  Cache local     : $LOCAL"
 echo "  Dossiers        : ~/Bureau, ~/Téléchargements, ~/Documents…"
 echo "                    → pointent vers le cache local"
 echo "                    → synchronisés automatiquement avec le NAS"
 echo ""
-echo "  Interface       : icône dans la barre système GNOME"
-echo "                    (visible quand la synchro est active)"
-echo "                    Démarre automatiquement à chaque login"
-echo ""
 echo "  Commandes utiles :"
-echo "    Statut démon     : systemctl --user status nas-sync"
-echo "    Logs             : tail -f ~/.nas_sync.log"
+echo "    Statut démon       : systemctl --user status nas-sync"
+echo "    Logs               : tail -f ~/.nas_sync.log"
 echo "    Activer/désactiver : bash $SCRIPT_DIR/toggle.sh"
+else
+echo "  Dossiers        : ~/Bureau, ~/Téléchargements, ~/Documents…"
+echo "                    → pointent directement vers le NAS ($NAS)"
+echo "                    (le NAS doit être monté pour accéder aux fichiers)"
+fi
+echo ""
+echo "  Interface       : icône dans la barre système GNOME"
+echo "                    Démarre automatiquement à chaque login"
+echo "                    Pour changer de mode : Paramètres → onglet Mode"
 echo ""
 echo "  Action Nautilus (une seule fois) :"
 echo "    Clic droit sur anciens favoris → Retirer des favoris"
+if [ "$INSTALL_MODE" = "portable" ]; then
 echo "    Glisser les dossiers de ~/offline_cache/ dans la barre latérale"
+else
+echo "    Glisser les dossiers de ~/NasShare/ dans la barre latérale"
+fi
 echo ""

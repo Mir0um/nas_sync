@@ -72,6 +72,7 @@ class SetupWizard(Gtk.Assistant):
 
     def _build_pages(self):
         self._p_welcome    = self._page_welcome()
+        self._p_mode       = self._page_mode()
         self._p_connexion  = self._page_connexion()
         self._p_dossiers   = self._page_dossiers()
         self._p_options    = self._page_options()
@@ -79,10 +80,11 @@ class SetupWizard(Gtk.Assistant):
 
         for p, ptype, title, complete in [
             (self._p_welcome,   Gtk.AssistantPageType.INTRO,    "Bienvenue",                  True),
-            (self._p_connexion, Gtk.AssistantPageType.CONTENT,  "1 · Connexion au NAS",       False),
-            (self._p_dossiers,  Gtk.AssistantPageType.CONTENT,  "2 · Dossiers",               True),
-            (self._p_options,   Gtk.AssistantPageType.CONTENT,  "3 · Options",                True),
-            (self._p_install,   Gtk.AssistantPageType.SUMMARY,  "4 · Installation",           False),
+            (self._p_mode,      Gtk.AssistantPageType.CONTENT,  "1 · Mode d'utilisation",     True),
+            (self._p_connexion, Gtk.AssistantPageType.CONTENT,  "2 · Connexion au NAS",       False),
+            (self._p_dossiers,  Gtk.AssistantPageType.CONTENT,  "3 · Dossiers",               True),
+            (self._p_options,   Gtk.AssistantPageType.CONTENT,  "4 · Options",                True),
+            (self._p_install,   Gtk.AssistantPageType.SUMMARY,  "5 · Installation",           False),
         ]:
             self.append_page(p)
             self.set_page_type(p, ptype)
@@ -129,7 +131,49 @@ class SetupWizard(Gtk.Assistant):
 
         return vbox
 
-    # ── Page 1 : Connexion NAS ────────────────────────────────────────────────
+    # ── Page 1 : Mode d'utilisation ──────────────────────────────────────────
+
+    def _page_mode(self) -> Gtk.Widget:
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        vbox.set_border_width(32)
+
+        vbox.pack_start(note(
+            "Choisissez le mode adapté à votre usage. "
+            "Vous pourrez en changer à tout moment dans les Paramètres."
+        ), False, False, 0)
+        vbox.pack_start(Gtk.Separator(), False, False, 4)
+
+        self._wiz_mode_portable = Gtk.RadioButton.new_with_label(
+            None, "PC portable — cache local + synchronisation automatique"
+        )
+        self._wiz_mode_portable.set_active(True)
+        desc_p = Gtk.Label(
+            label="    Vos fichiers sont copiés localement dans ~/offline_cache/.\n"
+                  "    Accessibles même sans réseau. Synchronisés dès la reconnexion au NAS."
+        )
+        desc_p.set_xalign(0)
+        desc_p.set_line_wrap(True)
+        vbox.pack_start(self._wiz_mode_portable, False, False, 0)
+        vbox.pack_start(desc_p, False, False, 0)
+
+        vbox.pack_start(Gtk.Separator(), False, False, 4)
+
+        self._wiz_mode_fixe = Gtk.RadioButton.new_with_label_from_widget(
+            self._wiz_mode_portable, "PC fixe — accès direct au NAS"
+        )
+        desc_f = Gtk.Label(
+            label="    Vos dossiers pointent directement vers le NAS.\n"
+                  "    Simple et rapide. Le NAS doit être accessible en permanence.\n"
+                  "    La synchronisation automatique est désactivée."
+        )
+        desc_f.set_xalign(0)
+        desc_f.set_line_wrap(True)
+        vbox.pack_start(self._wiz_mode_fixe, False, False, 0)
+        vbox.pack_start(desc_f, False, False, 0)
+
+        return vbox
+
+    # ── Page 2 : Connexion NAS ────────────────────────────────────────────────
 
     def _page_connexion(self) -> Gtk.Widget:
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -441,6 +485,10 @@ class SetupWizard(Gtk.Assistant):
         def prog(f, t=""): GLib.idle_add(self._set_progress, f, t)
 
         try:
+            # ── 0. Lire le mode choisi ────────────────────────────────────────
+            mode = "fixe" if self._wiz_mode_fixe.get_active() else "portable"
+            log(f"→ Mode sélectionné : {mode}")
+
             # ── 1. Construire la config ───────────────────────────────────────
             log("→ Création de la configuration…")
             prog(0.05, "Configuration…")
@@ -456,6 +504,7 @@ class SetupWizard(Gtk.Assistant):
                     })
 
             cfg = DEFAULT_CONFIG.copy()
+            cfg["mode"]                   = mode
             cfg["nas_host"]               = self._wiz_entries["nas_host"].get_text().strip()
             cfg["nas_mount"]              = self._wiz_entries["nas_mount"].get_text().strip()
             cfg["check_interval"]         = int(self._spin_check.get_value())
@@ -479,7 +528,7 @@ class SetupWizard(Gtk.Assistant):
                 log("  ✓ Credentials SMB enregistrés")
             prog(0.25)
 
-            # ── 3. Créer le cache local ───────────────────────────────────────
+            # ── 3. Créer le cache local (toujours, pour pouvoir basculer en portable) ─
             log("→ Création du cache local ~/offline_cache/…")
             for d in dirs:
                 (Path.home() / "offline_cache" / d["local_sub"]).mkdir(parents=True, exist_ok=True)
@@ -488,6 +537,8 @@ class SetupWizard(Gtk.Assistant):
 
             # ── 4. Liens symboliques ──────────────────────────────────────────
             log("→ Mise à jour des liens symboliques…")
+            nas_mount_path = Path(cfg.get("nas_mount", str(Path.home() / "NasShare")))
+            link_base = nas_mount_path if mode == "fixe" else (Path.home() / "offline_cache")
             FR_LINKS = {
                 "Desktop":   ["Bureau"],
                 "Downloads": ["Téléchargements"],
@@ -500,7 +551,7 @@ class SetupWizard(Gtk.Assistant):
             for local_sub, fr_names in FR_LINKS.items():
                 if local_sub not in local_subs:
                     continue
-                target = Path.home() / "offline_cache" / local_sub
+                target = link_base / local_sub
                 for name in fr_names:
                     link = Path.home() / name
                     if link.is_symlink():
@@ -517,6 +568,7 @@ class SetupWizard(Gtk.Assistant):
 
             # ── 5. XDG user-dirs ─────────────────────────────────────────────
             log("→ Mise à jour de ~/.config/user-dirs.dirs…")
+            xdg_base = f"$HOME/NasShare" if mode == "fixe" else "$HOME/offline_cache"
             xdg_map = {
                 "Desktop":   "XDG_DESKTOP_DIR",
                 "Downloads": "XDG_DOWNLOAD_DIR",
@@ -528,30 +580,33 @@ class SetupWizard(Gtk.Assistant):
             lines = []
             for local_sub, xdg_key in xdg_map.items():
                 if local_sub in local_subs:
-                    lines.append(f'{xdg_key}="$HOME/offline_cache/{local_sub}"')
+                    lines.append(f'{xdg_key}="{xdg_base}/{local_sub}"')
             xdg_file = Path.home() / ".config" / "user-dirs.dirs"
             xdg_file.write_text("\n".join(lines) + "\n")
             subprocess.run(["xdg-user-dirs-update"], capture_output=True)
             log("  ✓ XDG dirs mis à jour")
             prog(0.65)
 
-            # ── 6. Service systemd ────────────────────────────────────────────
-            log("→ Installation du service systemd…")
-            svc_dir = Path.home() / ".config" / "systemd" / "user"
-            svc_dir.mkdir(parents=True, exist_ok=True)
-            svc = svc_dir / SERVICE
-            svc.write_text(
-                f"[Unit]\nDescription=NAS Sync Daemon\n"
-                f"After=network.target graphical-session.target\n"
-                f"PartOf=graphical-session.target\n\n"
-                f"[Service]\nType=simple\n"
-                f"ExecStart=/usr/bin/python3 {DAEMON_PY}\n"
-                f"Restart=on-failure\nRestartSec=15\n\n"
-                f"[Install]\nWantedBy=graphical-session.target\n"
-            )
-            subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
-            subprocess.run(["systemctl", "--user", "enable", SERVICE], capture_output=True)
-            log("  ✓ Service installé et activé")
+            # ── 6. Service systemd (portable seulement) ───────────────────────
+            if mode == "portable":
+                log("→ Installation du service systemd…")
+                svc_dir = Path.home() / ".config" / "systemd" / "user"
+                svc_dir.mkdir(parents=True, exist_ok=True)
+                svc = svc_dir / SERVICE
+                svc.write_text(
+                    f"[Unit]\nDescription=NAS Sync Daemon\n"
+                    f"After=network.target graphical-session.target\n"
+                    f"PartOf=graphical-session.target\n\n"
+                    f"[Service]\nType=simple\n"
+                    f"ExecStart=/usr/bin/python3 {DAEMON_PY}\n"
+                    f"Restart=on-failure\nRestartSec=15\n\n"
+                    f"[Install]\nWantedBy=graphical-session.target\n"
+                )
+                subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+                subprocess.run(["systemctl", "--user", "enable", SERVICE], capture_output=True)
+                log("  ✓ Service installé et activé")
+            else:
+                log("  ℹ Mode PC fixe — service de synchronisation non activé")
             prog(0.80)
 
             # ── 7. Entrée menu GNOME ──────────────────────────────────────────
@@ -560,16 +615,91 @@ class SetupWizard(Gtk.Assistant):
             log("  ✓ Application visible dans GNOME Activities")
             prog(0.90)
 
-            # ── 8. Démarrer le démon ──────────────────────────────────────────
-            log("→ Démarrage du service…")
-            subprocess.run(["systemctl", "--user", "start", SERVICE], capture_output=True)
-            import time; time.sleep(1)
-            r = subprocess.run(["systemctl", "--user", "is-active", SERVICE],
-                               capture_output=True, text=True)
-            if r.stdout.strip() == "active":
-                log("  ✓ Service démarré")
+            # ── 8. Synchronisation initiale NAS → cache local ─────────────────
+            if mode == "portable":
+                import re as _re
+                nas_mnt = Path(cfg.get("nas_mount", str(Path.home() / "NasShare")))
+                if nas_mnt.is_mount():
+                    log("→ Synchronisation initiale NAS → cache local…")
+
+                    total_bytes = 0
+                    for d in dirs:
+                        nas_dir = nas_mnt / d.get("nas_sub", d["local_sub"])
+                        if nas_dir.exists():
+                            try:
+                                r2 = subprocess.run(
+                                    ["du", "-sb", str(nas_dir)],
+                                    capture_output=True, text=True, timeout=30,
+                                )
+                                if r2.returncode == 0:
+                                    total_bytes += int(r2.stdout.split()[0])
+                            except Exception:
+                                pass
+
+                    def _fmt_b(n):
+                        if n >= 1_000_000_000: return f"{n/1_000_000_000:.1f} Go"
+                        if n >= 1_000_000:     return f"{n/1_000_000:.1f} Mo"
+                        if n >= 1_000:         return f"{n/1_000:.0f} Ko"
+                        return f"{n} o"
+
+                    if total_bytes > 0:
+                        log(f"  Volume estimé : {_fmt_b(total_bytes)}")
+
+                    bytes_offset = 0
+                    for d in dirs:
+                        src = nas_mnt / d.get("nas_sub", d["local_sub"])
+                        dst = Path.home() / "offline_cache" / d["local_sub"]
+                        if not src.exists():
+                            log(f"  ⚠ {d['local_sub']} absent sur le NAS — ignoré")
+                            continue
+                        log(f"  Copie {d['local_sub']}…")
+                        try:
+                            proc = subprocess.Popen(
+                                ["rsync", "-ah", "--ignore-existing", "--info=progress2",
+                                 str(src) + "/", str(dst) + "/"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, bufsize=1,
+                            )
+                            dir_bytes = 0
+                            for line in proc.stdout:
+                                m2 = _re.match(r'\s*([\d,]+)\s+\d+%', line)
+                                if m2:
+                                    dir_bytes = int(m2.group(1).replace(',', ''))
+                                    if total_bytes > 0:
+                                        done_b = bytes_offset + dir_bytes
+                                        pct    = int(done_b * 100 / total_bytes)
+                                        frac   = 0.90 + 0.07 * done_b / total_bytes
+                                        GLib.idle_add(
+                                            self._set_progress,
+                                            min(frac, 0.97),
+                                            f"{pct}% — {_fmt_b(done_b)} / {_fmt_b(total_bytes)}",
+                                        )
+                            proc.wait()
+                            bytes_offset += dir_bytes
+                            log(f"  ✓ {d['local_sub']} ({_fmt_b(dir_bytes)} copiés)")
+                        except FileNotFoundError:
+                            log("  ⚠ rsync non disponible — synchro initiale ignorée")
+                            break
+                        except Exception as e:
+                            log(f"  ⚠ Erreur rsync {d['local_sub']}: {e}")
+                else:
+                    log("  ℹ NAS non monté — synchro initiale ignorée")
+                    log("    Relancez l'assistant depuis chez vous pour la copie initiale")
+            prog(0.97)
+
+            # ── 9. Démarrer le démon (portable seulement) ─────────────────────
+            if mode == "portable":
+                log("→ Démarrage du service…")
+                subprocess.run(["systemctl", "--user", "start", SERVICE], capture_output=True)
+                import time; time.sleep(1)
+                r = subprocess.run(["systemctl", "--user", "is-active", SERVICE],
+                                   capture_output=True, text=True)
+                if r.stdout.strip() == "active":
+                    log("  ✓ Service démarré")
+                else:
+                    log("  ⚠ Service démarré (vérifiez : systemctl --user status nas-sync)")
             else:
-                log("  ⚠ Service démarré (vérifiez : systemctl --user status nas-sync)")
+                log("  ℹ Mode PC fixe — pas de démon, accès direct au NAS")
             prog(1.0)
 
             GLib.idle_add(self._install_done)

@@ -22,6 +22,7 @@ _TRIM_EVERY  = 50    # fix 13 : élagage tous les N appels seulement
 _write_count = 0
 
 DEFAULT_CONFIG = {
+    "mode":            "portable",   # "portable" (sync) ou "fixe" (accès direct NAS)
     "nas_host":        "Cassis.local",
     "nas_port":        445,
     "nas_mount":       str(HOME / "NasShare"),
@@ -119,11 +120,14 @@ def read_events(n: int = 200) -> list:
 
 # ── progression (fix 6) ───────────────────────────────────────────────────────
 
-def write_progress(status: str, current: str = "", done: int = 0, total: int = 0):
+def write_progress(status: str, current: str = "", done: int = 0, total: int = 0,
+                   bytes_done: int = 0, bytes_total: int = 0):
     try:
         PROGRESS_FILE.write_text(json.dumps({
             "status": status, "current": current,
-            "done": done, "total": total, "ts": time.time(),
+            "done": done, "total": total,
+            "bytes_done": bytes_done, "bytes_total": bytes_total,
+            "ts": time.time(),
         }))
     except Exception:
         pass
