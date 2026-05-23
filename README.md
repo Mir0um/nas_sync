@@ -35,6 +35,7 @@ bash ~/programs/nas_sync/install.sh
 ```
 
 Le script installe automatiquement les dépendances manquantes, puis s'occupe de tout :
+- Vous permet de choisir quels dossiers synchroniser (ex : Documents oui, Vidéos non)
 - Copie initiale NAS → cache local
 - Redirige vos dossiers (`~/Bureau`, `~/Téléchargements`, etc.) vers le cache local
 - Installe et démarre le service systemd (démon de synchro)

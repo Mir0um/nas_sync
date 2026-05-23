@@ -40,6 +40,42 @@ esac
 ok "Mode : $INSTALL_MODE"
 echo ""
 
+# ── Paramétrage des dossiers à synchroniser ──────────────────────────────────
+
+DIR_DEFS=(
+    "Bureau|Desktop|Desktop|XDG_DESKTOP_DIR|0"
+    "Téléchargements|Downloads|Downloads|XDG_DOWNLOAD_DIR|90"
+    "Documents|Documents|Documents|XDG_DOCUMENTS_DIR|0"
+    "Musique|Music|Music|XDG_MUSIC_DIR|180"
+    "Images|Pictures|Pictures|XDG_PICTURES_DIR|0"
+    "Vidéos|video|video|XDG_VIDEOS_DIR|90"
+)
+
+SELECTED_DIRS=()
+SELECTED_DIR_LABELS=()
+
+echo "Choix des dossiers à synchroniser :"
+echo "(Entrée = Oui, n = Non)"
+for entry in "${DIR_DEFS[@]}"; do
+    IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
+    read -rp "  Synchroniser '$fr_name' ? [O/n] : " answer
+    case "$answer" in
+        n|N|no|NO|non|NON)
+            warn "$fr_name ignoré"
+            ;;
+        *)
+            SELECTED_DIRS+=("$entry")
+            SELECTED_DIR_LABELS+=("$fr_name")
+            ;;
+    esac
+done
+
+[ ${#SELECTED_DIRS[@]} -gt 0 ] || err "Aucun dossier sélectionné. Installation annulée."
+
+SELECTED_LABELS_JOINED="${SELECTED_DIR_LABELS[*]}"
+ok "Dossiers sélectionnés : $SELECTED_LABELS_JOINED"
+echo ""
+
 # ── Dépendances ───────────────────────────────────────────────────────────────
 
 echo "Vérification des dépendances…"
@@ -130,8 +166,9 @@ fi
 
 echo ""
 echo "Création du cache local $LOCAL …"
-for dir in Desktop Downloads Documents Music Pictures video; do
-    mkdir -p "$LOCAL/$dir"
+for entry in "${SELECTED_DIRS[@]}"; do
+    IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
+    mkdir -p "$LOCAL/$local_sub"
 done
 ok "Dossiers créés dans $LOCAL"
 
@@ -140,12 +177,11 @@ ok "Dossiers créés dans $LOCAL"
 if [ "$NAS_OK" = true ] && [ "$HAS_RSYNC" = true ] && [ "$INSTALL_MODE" = "portable" ]; then
     echo ""
     echo "Synchronisation initiale NAS → cache local …"
-    declare -A NAS_DIRS=( [Desktop]=Desktop [Downloads]=Downloads \
-        [Documents]=Documents [Music]=Music [Pictures]=Pictures [video]=video )
 
     # Calculer la taille totale avant de commencer
     total_bytes=0
-    for nas_sub in Desktop Downloads Documents Music Pictures video; do
+    for entry in "${SELECTED_DIRS[@]}"; do
+        IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
         if [ -d "$NAS/$nas_sub" ]; then
             sz=$(du -sb "$NAS/$nas_sub" 2>/dev/null | awk '{print $1}')
             total_bytes=$(( total_bytes + ${sz:-0} ))
@@ -161,18 +197,18 @@ if [ "$NAS_OK" = true ] && [ "$HAS_RSYNC" = true ] && [ "$INSTALL_MODE" = "porta
     echo "  Volume total à copier : $total_human"
     echo ""
 
-    for local_sub in "${!NAS_DIRS[@]}"; do
-        nas_sub="${NAS_DIRS[$local_sub]}"
+    for entry in "${SELECTED_DIRS[@]}"; do
+        IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
         if [ -d "$NAS/$nas_sub" ]; then
             nb=$(find "$NAS/$nas_sub" -type f 2>/dev/null | wc -l)
             sz=$(du -sh "$NAS/$nas_sub" 2>/dev/null | awk '{print $1}')
-            echo "  $nas_sub ($nb fichiers, $sz) :"
+            echo "  $fr_name ($nb fichiers, $sz) :"
             rsync -ah --ignore-existing --info=progress2 \
                 "$NAS/$nas_sub/" "$LOCAL/$local_sub/" 2>/dev/null || true
             echo ""
-            ok "$nas_sub synchronisé"
+            ok "$fr_name synchronisé"
         else
-            warn "$nas_sub absent sur le NAS — ignoré"
+            warn "$fr_name absent sur le NAS — ignoré"
         fi
     done
 fi
@@ -186,16 +222,10 @@ if [ "$INSTALL_MODE" = "fixe" ]; then
 else
     LINK_BASE="$LOCAL"
 fi
-declare -A SYMLINKS=(
-    ["$HOME/Bureau"]="$LINK_BASE/Desktop"
-    ["$HOME/Téléchargements"]="$LINK_BASE/Downloads"
-    ["$HOME/Documents"]="$LINK_BASE/Documents"
-    ["$HOME/Musique"]="$LINK_BASE/Music"
-    ["$HOME/Images"]="$LINK_BASE/Pictures"
-    ["$HOME/Vidéos"]="$LINK_BASE/video"
-)
-for link_path in "${!SYMLINKS[@]}"; do
-    target="${SYMLINKS[$link_path]}"
+for entry in "${SELECTED_DIRS[@]}"; do
+    IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
+    link_path="$HOME/$fr_name"
+    target="$LINK_BASE/$local_sub"
     if [ -L "$link_path" ]; then
         rm "$link_path"
     elif [ -d "$link_path" ]; then
@@ -215,14 +245,12 @@ if [ "$INSTALL_MODE" = "fixe" ]; then
 else
     XDG_BASE="\$HOME/offline_cache"
 fi
-cat > "$HOME/.config/user-dirs.dirs" << EOF
-XDG_DESKTOP_DIR="${XDG_BASE}/Desktop"
-XDG_DOWNLOAD_DIR="${XDG_BASE}/Downloads"
-XDG_DOCUMENTS_DIR="${XDG_BASE}/Documents"
-XDG_MUSIC_DIR="${XDG_BASE}/Music"
-XDG_PICTURES_DIR="${XDG_BASE}/Pictures"
-XDG_VIDEOS_DIR="${XDG_BASE}/video"
-EOF
+{
+    for entry in "${SELECTED_DIRS[@]}"; do
+        IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
+        echo "${xdg_key}=\"${XDG_BASE}/${local_sub}\""
+    done
+} > "$HOME/.config/user-dirs.dirs"
 xdg-user-dirs-update 2>/dev/null || true
 ok "XDG user-dirs mis à jour"
 
@@ -246,6 +274,12 @@ cfg_path = Path("$CONFIG")
 if cfg_path.exists():
     cfg = json.loads(cfg_path.read_text())
     cfg["mode"] = "$INSTALL_MODE"
+    cfg["dirs"] = [
+$(for entry in "${SELECTED_DIRS[@]}"; do
+    IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
+    echo "        {\"local_sub\": \"$local_sub\", \"nas_sub\": \"$nas_sub\", \"enabled\": True, \"max_age_days\": $max_age},"
+done)
+    ]
     cfg_path.write_text(json.dumps(cfg, indent=2))
 PYEOF
 ok "Mode '$INSTALL_MODE' enregistré dans la configuration"
@@ -318,7 +352,7 @@ echo ""
 echo "  Mode            : $INSTALL_MODE"
 if [ "$INSTALL_MODE" = "portable" ]; then
 echo "  Cache local     : $LOCAL"
-echo "  Dossiers        : ~/Bureau, ~/Téléchargements, ~/Documents…"
+echo "  Dossiers        : ${SELECTED_LABELS_JOINED}"
 echo "                    → pointent vers le cache local"
 echo "                    → synchronisés automatiquement avec le NAS"
 echo ""
@@ -327,7 +361,7 @@ echo "    Statut démon       : systemctl --user status nas-sync"
 echo "    Logs               : tail -f ~/.nas_sync.log"
 echo "    Activer/désactiver : bash $SCRIPT_DIR/toggle.sh"
 else
-echo "  Dossiers        : ~/Bureau, ~/Téléchargements, ~/Documents…"
+echo "  Dossiers        : ${SELECTED_LABELS_JOINED}"
 echo "                    → pointent directement vers le NAS ($NAS)"
 echo "                    (le NAS doit être monté pour accéder aux fichiers)"
 fi
