@@ -408,19 +408,34 @@ else
         [ -d "$src" ] || { warn "Dossier '$fr_name' absent sur le NAS — ignoré"; continue; }
 
         # Taille effective (avec quota si défini)
+        files_from_tmp=""
         if [ "$quota_go" -gt 0 ]; then
             effective_bytes=$(( quota_go * 1073741824 ))
             [ "$effective_bytes" -gt "$nas_bytes" ] && effective_bytes=$nas_bytes
             size_label="quota ${quota_go} Go"
-            max_size_arg="--max-size=${quota_go}g"
+            # Construire une liste de fichiers triés par date (plus récent d'abord)
+            # dont le cumul ne dépasse pas le budget quota.
+            files_from_tmp=$(mktemp /tmp/nassync_quota_XXXXXX.txt)
+            find "$src" -type f -printf '%T@ %s %P\n' | sort -rn | awk -v budget="$effective_bytes" '
+            BEGIN { cumul = 0 }
+            {
+                sz = $2
+                if (cumul + sz <= budget) {
+                    cumul += sz
+                    # Imprimer le chemin relatif (du champ 3 à la fin)
+                    for (i = 3; i <= NF; i++) printf "%s%s", (i>3 ? " " : ""), $i
+                    printf "\n"
+                }
+            }' > "$files_from_tmp"
+            rsync_extra_args="--files-from=$files_from_tmp"
         else
             effective_bytes=$nas_bytes
             size_label="$(fmt_bytes $effective_bytes)"
-            max_size_arg=""
+            rsync_extra_args=""
         fi
 
         echo -e "  ${BOLD}${CYAN}»${NC} Synchronisation de : ${BOLD}$fr_name${NC} ($size_label)"
-        rsync -ah --ignore-existing --info=progress2 $max_size_arg \
+        rsync -ah --ignore-existing --info=progress2 $rsync_extra_args \
             "$src/" "$dst/" 2>/dev/null | \
             awk -v fr="$fr_name" -v RS='\r' '
             {
@@ -470,6 +485,7 @@ else
             }
             ' || true
         ok "$fr_name synchronisé avec succès"
+        [ -n "$files_from_tmp" ] && rm -f "$files_from_tmp"
         echo ""
     done
 fi

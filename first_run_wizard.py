@@ -546,7 +546,8 @@ class SetupWizard(Gtk.Assistant):
                 spin.set_value(0)   # 0 = illimité, tout rentre
         else:
             for spin, sz in selected:
-                quota_go = max(1, int(sz / total_nas * budget) // 1_073_741_824) if sz > 0 else 0
+                quota_go = int(sz / total_nas * budget / 1_073_741_824) if sz > 0 else 0
+                quota_go = max(1, quota_go) if sz > 0 else 0
                 spin.set_value(quota_go)
 
         self._update_disk_banner()
@@ -942,12 +943,34 @@ class SetupWizard(Gtk.Assistant):
                 # Construire la commande rsync avec filtre par quota si besoin
                 rsync_cmd = ["rsync", "-ah", "--ignore-existing", "--info=progress2"]
                 max_mb = d.get("max_size_mb", 0)
+                files_from_path = None
                 if max_mb > 0:
-                    # Trier par date via find + rsync --files-from n'est pas simple ;
-                    # on passe max_size à rsync via --max-size pour bloquer les très
-                    # gros fichiers individuels, la sélection finale sera affinée par
-                    # le démon (quota_trim). Ici on copie simplement jusqu'à l'espace.
-                    rsync_cmd += [f"--max-size={max_mb}m"]
+                    # Construire une liste de fichiers triés par date (plus récent
+                    # d'abord) dont le cumul ne dépasse pas le budget quota.
+                    budget = max_mb * 1_048_576
+                    all_files = []
+                    for f in src.rglob("*"):
+                        if f.is_file():
+                            try:
+                                st = f.stat()
+                                all_files.append((f.relative_to(src), st.st_mtime, st.st_size))
+                            except OSError:
+                                pass
+                    all_files.sort(key=lambda x: x[1], reverse=True)
+                    cumul = 0
+                    selected = []
+                    for rel, _mt, sz in all_files:
+                        if cumul + sz > budget:
+                            continue
+                        selected.append(str(rel))
+                        cumul += sz
+                    # Écrire la liste dans un fichier temporaire
+                    import tempfile
+                    fd, files_from_path = tempfile.mkstemp(prefix="nassync_quota_", suffix=".txt")
+                    with os.fdopen(fd, "w") as ff:
+                        ff.write("\n".join(selected) + "\n")
+                    rsync_cmd += [f"--files-from={files_from_path}"]
+                    dir_total = cumul  # Ajuster la taille attendue au quota réel
                 rsync_cmd += [str(src) + "/", str(dst) + "/"]
 
                 try:
@@ -968,6 +991,12 @@ class SetupWizard(Gtk.Assistant):
                     GLib.idle_add(self._set_sync_done, sub, 0)
                 except Exception:
                     GLib.idle_add(self._set_sync_done, sub, 0)
+                finally:
+                    if files_from_path:
+                        try:
+                            os.unlink(files_from_path)
+                        except OSError:
+                            pass
 
             # Démarrer le démon après la sync initiale
             if not IS_FLATPAK:
