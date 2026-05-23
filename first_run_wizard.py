@@ -316,18 +316,14 @@ class SetupWizard(Gtk.Assistant):
     # ── Page 2 : Dossiers ─────────────────────────────────────────────────────
 
     def _page_dossiers(self) -> Gtk.Widget:
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        vbox.set_border_width(24)
-        vbox.pack_start(note(
-            "Sélectionnez les dossiers à synchroniser. "
-            "Le filtre par âge évite de dupliquer des années de fichiers volumineux."
-        ), False, False, 0)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        vbox.set_border_width(20)
 
-        self._dir_rows       = []
+        self._dir_rows        = []
         self._dir_size_labels = []
-        self._nas_dir_sizes  = {}  # local_sub → octets (rempli après scan NAS)
+        self._nas_dir_sizes   = {}
 
-        # (label, local_sub, nas_sub, enabled, max_age_days, max_size_mb)
+        # (nom affiché, local_sub, nas_sub, enabled, max_age_days, quota_go)
         defaults = [
             ("Bureau",          "Desktop",   "Desktop",   True,  0,   0),
             ("Téléchargements", "Downloads", "Downloads", True,  90,  0),
@@ -337,73 +333,86 @@ class SetupWizard(Gtk.Assistant):
             ("Vidéos",          "video",     "video",     True,  90,  0),
         ]
 
-        grid = Gtk.Grid()
-        grid.set_row_spacing(8)
-        grid.set_column_spacing(10)
-        grid.set_margin_top(8)
-
+        # ── en-têtes ─────────────────────────────────────────────────────────
+        hdr = Gtk.Grid()
+        hdr.set_column_spacing(10)
         for col, (h, w) in enumerate([
-            ("", 30), ("Dossier", 150), ("NAS", 120),
-            ("Âge max (j, 0=∞)", 130), ("Taille max (Mo, 0=∞)", 150), ("Sur le NAS", 100),
+            ("Dossier", 160), ("Sur le NAS", 90), ("Quota (Go, 0 = tout)", 140), ("Âge max (j, 0=∞)", 120),
         ]):
             lbl = Gtk.Label()
-            lbl.set_markup(f"<b>{h}</b>")
+            lbl.set_markup(f"<small><b>{h}</b></small>")
             lbl.set_xalign(0)
             lbl.set_size_request(w, -1)
-            grid.attach(lbl, col, 0, 1, 1)
+            hdr.attach(lbl, col, 0, 1, 1)
+        vbox.pack_start(hdr, False, False, 0)
 
-        for row, (label, local_sub, nas_sub, enabled, max_age, max_size) in enumerate(defaults, 1):
+        vbox.pack_start(Gtk.Separator(), False, False, 0)
+
+        # ── lignes dossiers ───────────────────────────────────────────────────
+        self._dir_list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        for label, local_sub, nas_sub, enabled, max_age, quota_go in defaults:
+            row_box = Gtk.Grid()
+            row_box.set_column_spacing(10)
+            row_box.set_margin_top(2)
+
             chk = Gtk.CheckButton(label=label)
             chk.set_active(enabled)
+            chk.set_size_request(160, -1)
             chk.connect("toggled", lambda *_: GLib.idle_add(self._update_disk_banner))
 
-            e_local = Gtk.Entry(); e_local.set_text(local_sub); e_local.set_width_chars(13)
-            e_nas   = Gtk.Entry(); e_nas.set_text(nas_sub);     e_nas.set_width_chars(11)
+            size_lbl = Gtk.Label(label="…")
+            size_lbl.set_xalign(0)
+            size_lbl.set_size_request(90, -1)
+
+            spin_size = Gtk.SpinButton()
+            spin_size.set_adjustment(Gtk.Adjustment(
+                value=quota_go, lower=0, upper=100_000, step_increment=1, page_increment=10,
+            ))
+            spin_size.set_numeric(True)
+            spin_size.set_size_request(140, -1)
+            spin_size.set_tooltip_text("0 = tout télécharger. Sinon, seuls les fichiers les plus récents sont conservés.")
 
             spin_age = Gtk.SpinButton()
             spin_age.set_adjustment(Gtk.Adjustment(value=max_age, lower=0, upper=3650, step_increment=30))
             spin_age.set_numeric(True)
+            spin_age.set_size_request(120, -1)
+            spin_age.set_tooltip_text("0 = aucun filtre par âge.")
 
-            spin_size = Gtk.SpinButton()
-            spin_size.set_adjustment(Gtk.Adjustment(value=max_size, lower=0, upper=1_000_000, step_increment=1024))
-            spin_size.set_numeric(True)
-            spin_size.set_width_chars(8)
+            # champs cachés (nom interne)
+            e_local = Gtk.Entry(); e_local.set_text(local_sub); e_local.set_no_show_all(True)
+            e_nas   = Gtk.Entry(); e_nas.set_text(nas_sub);     e_nas.set_no_show_all(True)
 
-            size_lbl = Gtk.Label(label="—")
-            size_lbl.set_xalign(0)
-            size_lbl.set_width_chars(9)
+            row_box.attach(chk,       0, 0, 1, 1)
+            row_box.attach(size_lbl,  1, 0, 1, 1)
+            row_box.attach(spin_size, 2, 0, 1, 1)
+            row_box.attach(spin_age,  3, 0, 1, 1)
+            row_box.attach(e_local,   4, 0, 1, 1)
+            row_box.attach(e_nas,     5, 0, 1, 1)
 
-            grid.attach(chk,       0, row, 1, 1)
-            grid.attach(e_local,   1, row, 1, 1)
-            grid.attach(e_nas,     2, row, 1, 1)
-            grid.attach(spin_age,  3, row, 1, 1)
-            grid.attach(spin_size, 4, row, 1, 1)
-            grid.attach(size_lbl,  5, row, 1, 1)
+            self._dir_list_box.pack_start(row_box, False, False, 0)
             self._dir_rows.append((chk, e_local, e_nas, spin_age, spin_size))
             self._dir_size_labels.append(size_lbl)
 
-        sw = Gtk.ScrolledWindow()
-        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        sw.set_min_content_height(240)
-        sw.add(grid)
-        vbox.pack_start(sw, True, True, 0)
+        vbox.pack_start(self._dir_list_box, False, False, 0)
+        vbox.pack_start(Gtk.Separator(), False, False, 4)
 
-        vbox.pack_start(Gtk.Separator(), False, False, 2)
-
-        # Bannière espace disque / recommandation
+        # ── bannière bilan espace ─────────────────────────────────────────────
         self._disk_banner = Gtk.Label()
         self._disk_banner.set_markup(
-            "<small><i>Connectez-vous au NAS (page précédente) pour afficher les tailles réelles.</i></small>"
+            "<small><i>Connexion au NAS requise pour afficher les tailles réelles.</i></small>"
         )
         self._disk_banner.set_xalign(0)
         self._disk_banner.set_line_wrap(True)
         vbox.pack_start(self._disk_banner, False, False, 0)
 
-        self._btn_recommend = Gtk.Button(label="Appliquer les limites suggérées")
+        self._btn_recommend = Gtk.Button(label="Répartir automatiquement l'espace disponible")
         self._btn_recommend.connect("clicked", self._apply_recommendations)
         self._btn_recommend.set_sensitive(False)
         self._btn_recommend.set_halign(Gtk.Align.START)
-        vbox.pack_start(self._btn_recommend, False, False, 4)
+        self._btn_recommend.set_tooltip_text(
+            "Calcule un quota par dossier pour que tout tienne sur le disque (85% de l'espace libre)."
+        )
+        vbox.pack_start(self._btn_recommend, False, False, 0)
 
         return vbox
 
@@ -537,8 +546,8 @@ class SetupWizard(Gtk.Assistant):
                 spin.set_value(0)   # 0 = illimité, tout rentre
         else:
             for spin, sz in selected:
-                quota_mb = max(1, int(sz / total_nas * budget) // 1_048_576) if sz > 0 else 0
-                spin.set_value(quota_mb)
+                quota_go = max(1, int(sz / total_nas * budget) // 1_073_741_824) if sz > 0 else 0
+                spin.set_value(quota_go)
 
         self._update_disk_banner()
 
@@ -602,30 +611,122 @@ class SetupWizard(Gtk.Assistant):
     # ── Page 4 : Installation ─────────────────────────────────────────────────
 
     def _page_install(self) -> Gtk.Widget:
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        vbox.set_border_width(24)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        vbox.set_border_width(20)
 
-        self._install_title = Gtk.Label()
-        self._install_title.set_markup("<b>Installation en cours…</b>")
-        self._install_title.set_xalign(0)
-        vbox.pack_start(self._install_title, False, False, 0)
+        # ── Phase 1 : Configuration ───────────────────────────────────────────
+        ph1_hdr = Gtk.Label()
+        ph1_hdr.set_markup("<b>① Configuration</b>")
+        ph1_hdr.set_xalign(0)
+        ph1_hdr.set_margin_bottom(6)
+        vbox.pack_start(ph1_hdr, False, False, 0)
 
-        self._progress = Gtk.ProgressBar()
-        self._progress.set_pulse_step(0.1)
-        vbox.pack_start(self._progress, False, False, 0)
+        self._step_labels = {}
+        for key, text in [
+            ("config",    "Paramètres enregistrés"),
+            ("creds",     "Credentials SMB"),
+            ("cache",     "Cache local créé"),
+            ("symlinks",  "Liens symboliques"),
+            ("xdg",       "Dossiers XDG"),
+            ("service",   "Service systemd"),
+            ("menu",      "Entrée menu applications"),
+        ]:
+            row = Gtk.Box(spacing=8)
+            row.set_margin_start(16)
+            row.set_margin_bottom(2)
+            icon = Gtk.Label(label="○")
+            icon.set_width_chars(2)
+            lbl = Gtk.Label(label=text)
+            lbl.set_xalign(0)
+            row.pack_start(icon, False, False, 0)
+            row.pack_start(lbl,  False, False, 0)
+            vbox.pack_start(row, False, False, 0)
+            self._step_labels[key] = (icon, lbl)
 
-        self._install_log = Gtk.TextBuffer()
-        tv = Gtk.TextView(buffer=self._install_log)
-        tv.set_editable(False)
-        tv.set_monospace(True)
-        tv.set_wrap_mode(Gtk.WrapMode.WORD)
-        sw = Gtk.ScrolledWindow()
-        sw.set_min_content_height(280)
-        sw.add(tv)
-        self._install_tv = tv
-        vbox.pack_start(sw, True, True, 0)
+        vbox.pack_start(Gtk.Separator(), False, False, 10)
+
+        # ── Phase 2 : Synchronisation ─────────────────────────────────────────
+        ph2_hdr = Gtk.Label()
+        ph2_hdr.set_markup("<b>② Synchronisation initiale</b>")
+        ph2_hdr.set_xalign(0)
+        ph2_hdr.set_margin_bottom(6)
+        vbox.pack_start(ph2_hdr, False, False, 0)
+        self._ph2_header = ph2_hdr
+
+        self._sync_rows  = {}   # local_sub → (bar, lbl)
+        self._sync_box   = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._sync_box.set_margin_start(16)
+        vbox.pack_start(self._sync_box, False, False, 0)
+
+        self._sync_pending = Gtk.Label()
+        self._sync_pending.set_markup(
+            "<small><i>Démarrera après la configuration…</i></small>"
+        )
+        self._sync_pending.set_xalign(0)
+        self._sync_pending.set_margin_start(16)
+        vbox.pack_start(self._sync_pending, False, False, 0)
+
+        # Message "vous pouvez fermer"
+        self._close_hint = Gtk.Label()
+        self._close_hint.set_markup(
+            '<small><span foreground="#1a7f37">● '
+            'La synchronisation continue en arrière-plan — vous pouvez fermer cette fenêtre.'
+            '</span></small>'
+        )
+        self._close_hint.set_xalign(0)
+        self._close_hint.set_margin_top(10)
+        self._close_hint.set_no_show_all(True)
+        vbox.pack_start(self._close_hint, False, False, 0)
 
         return vbox
+
+    def _step_done(self, key: str, ok: bool = True, detail: str = ""):
+        icon, lbl = self._step_labels[key]
+        if ok:
+            icon.set_markup('<span foreground="#1a7f37">✓</span>')
+        else:
+            icon.set_markup('<span foreground="#c0392b">✗</span>')
+        if detail:
+            lbl.set_markup(f"{lbl.get_text()} <small>— {detail}</small>")
+        return False
+
+    def _step_skip(self, key: str, reason: str = ""):
+        icon, lbl = self._step_labels[key]
+        icon.set_markup('<span foreground="#888">—</span>')
+        if reason:
+            lbl.set_markup(f'<span foreground="#888">{lbl.get_text()}</span> <small>({reason})</small>')
+        return False
+
+    def _add_sync_row(self, local_sub: str, total_bytes: int):
+        """Ajoute une ligne de progression rsync pour un dossier."""
+        row = Gtk.Box(spacing=8)
+        name_lbl = Gtk.Label(label=local_sub)
+        name_lbl.set_width_chars(14)
+        name_lbl.set_xalign(0)
+        bar = Gtk.ProgressBar()
+        bar.set_size_request(200, -1)
+        bar.set_show_text(True)
+        bar.set_text("en attente…")
+        row.pack_start(name_lbl, False, False, 0)
+        row.pack_start(bar,      True,  True,  0)
+        self._sync_box.pack_start(row, False, False, 0)
+        self._sync_box.show_all()
+        self._sync_rows[local_sub] = bar
+
+    def _set_sync_progress(self, local_sub: str, done: int, total: int):
+        bar = self._sync_rows.get(local_sub)
+        if not bar:
+            return
+        frac = min(done / total, 1.0) if total > 0 else 0.0
+        bar.set_fraction(frac)
+        bar.set_text(f"{self._fmt_size(done)} / {self._fmt_size(total)}")
+
+    def _set_sync_done(self, local_sub: str, copied: int):
+        bar = self._sync_rows.get(local_sub)
+        if not bar:
+            return
+        bar.set_fraction(1.0)
+        bar.set_text(f"✓ {self._fmt_size(copied)}" if copied else "✓ rien à copier")
 
     # ── Logique d'installation ────────────────────────────────────────────────
 
@@ -636,126 +737,104 @@ class SetupWizard(Gtk.Assistant):
         elif page is self._p_install:
             GLib.idle_add(self._run_install)
 
-    def _log(self, msg: str):
-        end = self._install_log.get_end_iter()
-        self._install_log.insert(end, msg + "\n")
-        # scroll vers le bas
-        adj = self._install_tv.get_vadjustment()
-        adj.set_value(adj.get_upper())
-
-    def _set_progress(self, frac: float, text: str = ""):
-        self._progress.set_fraction(frac)
-        if text:
-            self._progress.set_text(text)
-            self._progress.set_show_text(True)
-
     def _run_install(self):
         threading.Thread(target=self._do_install, daemon=True).start()
         return False
 
     def _do_install(self):
-        def ui(fn): GLib.idle_add(fn)
-        def log(m): GLib.idle_add(self._log, m)
-        def prog(f, t=""): GLib.idle_add(self._set_progress, f, t)
+        import re as _re
+        step = lambda k, ok=True, d="": GLib.idle_add(self._step_done, k, ok, d)
+        skip = lambda k, r="":          GLib.idle_add(self._step_skip, k, r)
 
         try:
-            # ── 0. Lire le mode choisi ────────────────────────────────────────
+            # ════════════════════════════════════════════════════════════════
+            # PHASE 1 : Configuration (rapide, user doit être présent)
+            # ════════════════════════════════════════════════════════════════
             mode = "fixe" if self._wiz_mode_fixe.get_active() else "portable"
-            log(f"→ Mode sélectionné : {mode}")
 
-            # ── 1. Construire la config ───────────────────────────────────────
-            log("→ Création de la configuration…")
-            prog(0.05, "Configuration…")
-
+            # 1. Config
             dirs = []
             for chk, e_local, e_nas, spin_age, spin_size in self._dir_rows:
                 if chk.get_active():
+                    quota_go = int(spin_size.get_value())
                     dirs.append({
                         "local_sub":    e_local.get_text().strip(),
                         "nas_sub":      e_nas.get_text().strip(),
                         "enabled":      True,
                         "max_age_days": int(spin_age.get_value()),
-                        "max_size_mb":  int(spin_size.get_value()),
+                        "max_size_mb":  quota_go * 1024 if quota_go > 0 else 0,
                     })
-
             cfg = DEFAULT_CONFIG.copy()
-            cfg["mode"]                   = mode
-            cfg["nas_host"]               = self._wiz_entries["nas_host"].get_text().strip()
-            cfg["nas_mount"]              = self._wiz_entries["nas_mount"].get_text().strip()
-            cfg["check_interval"]         = int(self._spin_check.get_value())
-            cfg["sync_interval"]          = int(self._spin_sync.get_value())
-            cfg["conflict_mode"]          = self._conflict_combo.get_active_id()
-            cfg["backup_before_overwrite"] = self._chk_backup.get_active()
-            cfg["pause_on_battery"]       = self._chk_battery.get_active()
-            cfg["notifications"]          = self._chk_notif.get_active()
-            cfg["dirs"]                   = dirs
+            cfg.update({
+                "mode":                   mode,
+                "nas_host":               self._wiz_entries["nas_host"].get_text().strip(),
+                "nas_mount":              self._wiz_entries["nas_mount"].get_text().strip(),
+                "check_interval":         int(self._spin_check.get_value()),
+                "sync_interval":          int(self._spin_sync.get_value()),
+                "conflict_mode":          self._conflict_combo.get_active_id(),
+                "backup_before_overwrite": self._chk_backup.get_active(),
+                "pause_on_battery":       self._chk_battery.get_active(),
+                "notifications":          self._chk_notif.get_active(),
+                "dirs":                   dirs,
+            })
             save_config(cfg)
-            log("  ✓ Configuration enregistrée")
-            prog(0.15)
+            step("config")
 
-            # ── 2. Écrire .smbcredentials ─────────────────────────────────────
+            # 2. Credentials SMB
             user = self._wiz_entries["nas_user"].get_text().strip()
             pwd  = self._wiz_entries["nas_pass"].get_text().strip()
             if user and pwd:
                 creds = Path.home() / ".smbcredentials"
                 creds.write_text(f"username={user}\npassword={pwd}\ndomain=WORKGROUP\n")
                 creds.chmod(0o600)
-                log("  ✓ Credentials SMB enregistrés")
-            prog(0.25)
+                step("creds")
+            else:
+                skip("creds", "non renseignés")
 
-            # ── 3. Créer le cache local (toujours, pour pouvoir basculer en portable) ─
-            log("→ Création du cache local ~/offline_cache/…")
+            # 3. Cache local
             for d in dirs:
                 (Path.home() / "offline_cache" / d["local_sub"]).mkdir(parents=True, exist_ok=True)
-            log("  ✓ Dossiers créés")
-            prog(0.40)
+            step("cache")
 
-            # ── 4. Liens symboliques ──────────────────────────────────────────
-            log("→ Mise à jour des liens symboliques…")
-            nas_mount_path = Path(cfg.get("nas_mount", str(Path.home() / "NasShare")))
+            # 4. Liens symboliques
+            nas_mount_path = Path(cfg["nas_mount"])
             link_base = nas_mount_path if mode == "fixe" else (Path.home() / "offline_cache")
             FR_LINKS = {
-                "Desktop":   ["Bureau"],
-                "Downloads": ["Téléchargements"],
-                "Documents": ["Documents"],
-                "Pictures":  ["Images"],
-                "Music":     ["Musique"],
-                "video":     ["Vidéos"],
+                "Desktop":   "Bureau",
+                "Downloads": "Téléchargements",
+                "Documents": "Documents",
+                "Pictures":  "Images",
+                "Music":     "Musique",
+                "video":     "Vidéos",
             }
             local_subs = {d["local_sub"] for d in dirs}
-            for local_sub, fr_names in FR_LINKS.items():
+            errs = []
+            for local_sub, fr_name in FR_LINKS.items():
                 if local_sub not in local_subs:
                     continue
                 target = link_base / local_sub
-                for name in fr_names:
-                    link = Path.home() / name
-                    if link.is_symlink():
-                        link.unlink()
-                    elif link.is_dir():
-                        # Déplacer le contenu vers la cible avant de supprimer le dossier
-                        try:
-                            for item in list(link.iterdir()):
-                                dest = target / item.name
-                                if not dest.exists():
-                                    shutil.move(str(item), str(dest))
-                                    log(f"  ↳ déplacé : {item.name} → {target}")
-                            link.rmdir()
-                        except OSError as exc:
-                            log(f"  ✗ ~/{name} impossible à libérer : {exc}")
-                            log(f"    Déplacez manuellement son contenu vers {target}")
-                    if not link.exists():
-                        link.symlink_to(target)
-                        log(f"  ✓ ~/{name} → {target}")
-                    elif not link.is_symlink():
-                        log(f"  ✗ ~/{name} : dossier non vide — lien non créé")
-            prog(0.55)
+                link   = Path.home() / fr_name
+                if link.is_symlink():
+                    link.unlink()
+                elif link.is_dir():
+                    try:
+                        for item in list(link.iterdir()):
+                            dest = target / item.name
+                            if not dest.exists():
+                                shutil.move(str(item), str(dest))
+                        link.rmdir()
+                    except OSError as exc:
+                        errs.append(f"~/{fr_name}: {exc}")
+                if not link.exists():
+                    link.symlink_to(target)
+                elif not link.is_symlink():
+                    errs.append(f"~/{fr_name} non vide")
+            step("symlinks", ok=not errs, d="; ".join(errs) if errs else "")
 
-            # ── 5. XDG user-dirs ─────────────────────────────────────────────
-            log("→ Mise à jour de ~/.config/user-dirs.dirs…")
-            # Les XDG dirs pointent TOUJOURS vers les noms français (~/Bureau…).
-            # Ce sont ces noms français qui sont des liens symboliques vers le NAS
-            # ou le cache local. Ainsi user-dirs.dirs ne change jamais entre modes.
-            xdg_content = (
+            # 5. XDG user-dirs
+            xdg_file = Path.home() / ".config" / "user-dirs.dirs"
+            xdg_file.parent.mkdir(parents=True, exist_ok=True)
+            xdg_file.write_text(
                 'XDG_DESKTOP_DIR="$HOME/Bureau"\n'
                 'XDG_DOWNLOAD_DIR="$HOME/Téléchargements"\n'
                 'XDG_TEMPLATES_DIR="$HOME/Modèles"\n'
@@ -765,156 +844,137 @@ class SetupWizard(Gtk.Assistant):
                 'XDG_PICTURES_DIR="$HOME/Images"\n'
                 'XDG_VIDEOS_DIR="$HOME/Vidéos"\n'
             )
-            xdg_file = Path.home() / ".config" / "user-dirs.dirs"
-            xdg_file.parent.mkdir(parents=True, exist_ok=True)
-            xdg_file.write_text(xdg_content)
             (Path.home() / "Modèles").mkdir(exist_ok=True)
             (Path.home() / "Public").mkdir(exist_ok=True)
             subprocess.run(["xdg-user-dirs-update"], capture_output=True)
-            log("  ✓ XDG dirs mis à jour (noms français standards, tous les dossiers inclus)")
-            prog(0.65)
+            step("xdg")
 
-            # ── 6. Service systemd (portable seulement) ───────────────────────
+            # 6. Service systemd
             IS_FLATPAK = Path("/.flatpak-info").exists()
-            if mode == "portable":
-                if not IS_FLATPAK:
-                    log("→ Installation du service systemd…")
-                    svc_dir = Path.home() / ".config" / "systemd" / "user"
-                    svc_dir.mkdir(parents=True, exist_ok=True)
-                    svc = svc_dir / SERVICE
-                    svc.write_text(
-                        f"[Unit]\nDescription=NAS Sync Daemon\n"
-                        f"After=network.target graphical-session.target\n"
-                        f"PartOf=graphical-session.target\n\n"
-                        f"[Service]\nType=simple\n"
-                        f"ExecStart=/usr/bin/python3 {DAEMON_PY}\n"
-                        f"Restart=on-failure\nRestartSec=15\n\n"
-                        f"[Install]\nWantedBy=graphical-session.target\n"
-                    )
-                    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
-                    subprocess.run(["systemctl", "--user", "enable", SERVICE], capture_output=True)
-                    log("  ✓ Service installé et activé")
-                else:
-                    log("  ℹ Sous Flatpak — service systemd contourné (lancement direct)")
+            if mode == "portable" and not IS_FLATPAK:
+                svc_dir = Path.home() / ".config" / "systemd" / "user"
+                svc_dir.mkdir(parents=True, exist_ok=True)
+                (svc_dir / SERVICE).write_text(
+                    f"[Unit]\nDescription=NAS Sync Daemon\n"
+                    f"After=network.target graphical-session.target\n"
+                    f"PartOf=graphical-session.target\n\n"
+                    f"[Service]\nType=simple\n"
+                    f"ExecStart=/usr/bin/python3 {DAEMON_PY}\n"
+                    f"Restart=on-failure\nRestartSec=15\n\n"
+                    f"[Install]\nWantedBy=graphical-session.target\n"
+                )
+                subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+                subprocess.run(["systemctl", "--user", "enable", SERVICE], capture_output=True)
+                step("service")
+            elif mode == "portable" and IS_FLATPAK:
+                step("service", d="Flatpak")
             else:
-                log("  ℹ Mode PC fixe — service de synchronisation non activé")
-            prog(0.80)
+                skip("service", "mode PC fixe")
 
-            # ── 7. Entrée menu (XDG standard — GNOME, KDE, XFCE, Cinnamon…) ─────
-            log("→ Création de l'entrée menu applications…")
+            # 7. Entrée menu
             _install_desktop_entry()
-            log("  ✓ Application visible dans le menu des applications")
-            prog(0.90)
+            step("menu")
 
-            # ── 8. Synchronisation initiale NAS → cache local ─────────────────
-            if mode == "portable":
-                import re as _re
-                nas_mnt = Path(cfg.get("nas_mount", str(Path.home() / "NasShare")))
-                if nas_mnt.is_mount():
-                    log("→ Synchronisation initiale NAS → cache local…")
+            # ════════════════════════════════════════════════════════════════
+            # PHASE 2 : Synchronisation initiale (peut prendre du temps)
+            # L'utilisateur peut fermer la fenêtre dès ce point.
+            # ════════════════════════════════════════════════════════════════
 
-                    total_bytes = 0
-                    for d in dirs:
-                        nas_dir = nas_mnt / d.get("nas_sub", d["local_sub"])
-                        if nas_dir.exists():
-                            try:
-                                r2 = subprocess.run(
-                                    ["du", "-sb", str(nas_dir)],
-                                    capture_output=True, text=True, timeout=30,
-                                )
-                                if r2.returncode == 0:
-                                    total_bytes += int(r2.stdout.split()[0])
-                            except Exception:
-                                pass
+            nas_mnt = Path(cfg["nas_mount"])
 
-                    def _fmt_b(n):
-                        if n >= 1_000_000_000: return f"{n/1_000_000_000:.1f} Go"
-                        if n >= 1_000_000:     return f"{n/1_000_000:.1f} Mo"
-                        if n >= 1_000:         return f"{n/1_000:.0f} Ko"
-                        return f"{n} o"
+            if mode != "portable" or not nas_mnt.is_mount():
+                GLib.idle_add(self._sync_pending.set_markup,
+                    "<small><i>NAS non monté — relancez l'assistant depuis chez vous "
+                    "pour la copie initiale.</i></small>" if mode == "portable"
+                    else "<small><i>Mode PC fixe — accès direct au NAS, pas de copie locale.</i></small>")
+                GLib.idle_add(self._install_done)
+                return
 
-                    if total_bytes > 0:
-                        log(f"  Volume estimé : {_fmt_b(total_bytes)}")
+            # Préparer les barres de progression (phase 2 visible)
+            GLib.idle_add(self._sync_pending.hide)
+            GLib.idle_add(self._close_hint.show)
 
-                    import shutil as _shutil
-                    avail = _shutil.disk_usage(
-                        str(Path.home() / "offline_cache")
-                    ).free
-                    MARGIN = 1_073_741_824  # 1 Go
-                    if total_bytes > 0 and avail < total_bytes + MARGIN:
-                        log(f"  ⚠ Espace disque insuffisant pour la synchronisation initiale !")
-                        log(f"    Nécessaire : {_fmt_b(total_bytes + MARGIN)}")
-                        log(f"    Disponible : {_fmt_b(avail)}")
-                        log(f"    La synchro initiale est ignorée.")
-                        log(f"    Libérez de l'espace disque puis relancez l'assistant.")
-                        prog(0.97)
-                        GLib.idle_add(self._install_done)
-                        return
+            # Vérifier l'espace disque total estimé
+            total_bytes = 0
+            dir_sizes   = {}
+            for d in dirs:
+                nas_dir = nas_mnt / d.get("nas_sub", d["local_sub"])
+                if nas_dir.is_dir():
+                    # Tenir compte du quota Go si défini
+                    max_mb = d.get("max_size_mb", 0)
+                    try:
+                        r2 = subprocess.run(["du", "-sb", str(nas_dir)],
+                                            capture_output=True, text=True, timeout=30)
+                        full_sz = int(r2.stdout.split()[0]) if r2.returncode == 0 else 0
+                    except Exception:
+                        full_sz = 0
+                    capped = min(full_sz, max_mb * 1_048_576) if max_mb > 0 else full_sz
+                    dir_sizes[d["local_sub"]] = capped
+                    total_bytes += capped
 
-                    bytes_offset = 0
-                    for d in dirs:
-                        src = nas_mnt / d.get("nas_sub", d["local_sub"])
-                        dst = Path.home() / "offline_cache" / d["local_sub"]
-                        if not src.exists():
-                            log(f"  ⚠ {d['local_sub']} absent sur le NAS — ignoré")
-                            continue
-                        log(f"  Copie {d['local_sub']}…")
-                        try:
-                            proc = subprocess.Popen(
-                                ["rsync", "-ah", "--ignore-existing", "--info=progress2",
-                                 str(src) + "/", str(dst) + "/"],
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                text=True, bufsize=1,
-                            )
-                            dir_bytes = 0
-                            for line in proc.stdout:
-                                m2 = _re.match(r'\s*([\d,]+)\s+\d+%', line)
-                                if m2:
-                                    dir_bytes = int(m2.group(1).replace(',', ''))
-                                    if total_bytes > 0:
-                                        done_b = bytes_offset + dir_bytes
-                                        pct    = int(done_b * 100 / total_bytes)
-                                        frac   = 0.90 + 0.07 * done_b / total_bytes
-                                        GLib.idle_add(
-                                            self._set_progress,
-                                            min(frac, 0.97),
-                                            f"{pct}% — {_fmt_b(done_b)} / {_fmt_b(total_bytes)}",
-                                        )
-                            proc.wait()
-                            bytes_offset += dir_bytes
-                            log(f"  ✓ {d['local_sub']} ({_fmt_b(dir_bytes)} copiés)")
-                        except FileNotFoundError:
-                            log("  ⚠ rsync non disponible — synchro initiale ignorée")
-                            break
-                        except Exception as e:
-                            log(f"  ⚠ Erreur rsync {d['local_sub']}: {e}")
-                else:
-                    log("  ℹ NAS non monté — synchro initiale ignorée")
-                    log("    Relancez l'assistant depuis chez vous pour la copie initiale")
-            prog(0.97)
+            avail  = shutil.disk_usage(str(Path.home() / "offline_cache")).free
+            MARGIN = 1_073_741_824
+            if total_bytes > 0 and avail < total_bytes + MARGIN:
+                GLib.idle_add(self._sync_pending.set_markup,
+                    f'<small><span foreground="#c0392b">⚠ Espace insuffisant '
+                    f'({self._fmt_size(total_bytes + MARGIN)} requis, '
+                    f'{self._fmt_size(avail)} disponibles). '
+                    f'Libérez de l\'espace et relancez l\'assistant.</span></small>')
+                GLib.idle_add(self._sync_pending.show)
+                GLib.idle_add(self._install_done)
+                return
 
-            # ── 9. Démarrer le démon (portable seulement) ─────────────────────
-            if mode == "portable":
-                if not IS_FLATPAK:
-                    log("→ Démarrage du service…")
-                    subprocess.run(["systemctl", "--user", "start", SERVICE], capture_output=True)
-                    import time; time.sleep(1)
-                    r = subprocess.run(["systemctl", "--user", "is-active", SERVICE],
-                                       capture_output=True, text=True)
-                    if r.stdout.strip() == "active":
-                        log("  ✓ Service démarré")
-                    else:
-                        log("  ⚠ Service démarré (vérifiez : systemctl --user status nas-sync)")
-                else:
-                    log("→ Démarrage du démon en arrière-plan…")
-                    subprocess.Popen(
-                        [sys.executable, str(DAEMON_PY)],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            # Ajouter les barres de progression puis lancer rsync dir par dir
+            for d in dirs:
+                sz = dir_sizes.get(d["local_sub"], 0)
+                GLib.idle_add(self._add_sync_row, d["local_sub"], sz)
+
+            for d in dirs:
+                src      = nas_mnt / d.get("nas_sub", d["local_sub"])
+                dst      = Path.home() / "offline_cache" / d["local_sub"]
+                sub      = d["local_sub"]
+                dir_total = dir_sizes.get(sub, 0)
+
+                if not src.is_dir():
+                    GLib.idle_add(self._set_sync_done, sub, 0)
+                    continue
+
+                # Construire la commande rsync avec filtre par quota si besoin
+                rsync_cmd = ["rsync", "-ah", "--ignore-existing", "--info=progress2"]
+                max_mb = d.get("max_size_mb", 0)
+                if max_mb > 0:
+                    # Trier par date via find + rsync --files-from n'est pas simple ;
+                    # on passe max_size à rsync via --max-size pour bloquer les très
+                    # gros fichiers individuels, la sélection finale sera affinée par
+                    # le démon (quota_trim). Ici on copie simplement jusqu'à l'espace.
+                    rsync_cmd += [f"--max-size={max_mb}m"]
+                rsync_cmd += [str(src) + "/", str(dst) + "/"]
+
+                try:
+                    proc = subprocess.Popen(
+                        rsync_cmd,
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        text=True, bufsize=1,
                     )
-                    log("  ✓ Démon démarré")
+                    dir_done = 0
+                    for line in proc.stdout:
+                        m = _re.match(r'\s*([\d,]+)\s+\d+%', line)
+                        if m:
+                            dir_done = int(m.group(1).replace(',', ''))
+                            GLib.idle_add(self._set_sync_progress, sub, dir_done, dir_total)
+                    proc.wait()
+                    GLib.idle_add(self._set_sync_done, sub, dir_done)
+                except FileNotFoundError:
+                    GLib.idle_add(self._set_sync_done, sub, 0)
+                except Exception:
+                    GLib.idle_add(self._set_sync_done, sub, 0)
+
+            # Démarrer le démon après la sync initiale
+            if not IS_FLATPAK:
+                subprocess.run(["systemctl", "--user", "start", SERVICE], capture_output=True)
             else:
-                log("  ℹ Mode PC fixe — pas de démon, accès direct au NAS")
-            prog(1.0)
+                subprocess.Popen([sys.executable, str(DAEMON_PY)],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             GLib.idle_add(self._install_done)
 
@@ -922,20 +982,21 @@ class SetupWizard(Gtk.Assistant):
             GLib.idle_add(self._install_error, str(e))
 
     def _install_done(self):
-        self._install_title.set_markup(
-            '<span foreground="green"><b>✓ Installation terminée !</b></span>\n'
-            '<small>NAS Sync est actif. L\'icône apparaît dans la barre système\n'
-            'quand la synchronisation est en cours.</small>'
+        self._ph2_header.set_markup(
+            '<b>② Synchronisation initiale</b>  '
+            '<span foreground="#1a7f37">✓ terminée</span>'
         )
         self.set_page_complete(self._p_install, True)
         return False
 
     def _install_error(self, msg: str):
-        self._install_title.set_markup(
-            f'<span foreground="red"><b>✗ Erreur lors de l\'installation</b></span>\n'
-            f'<small>{msg}</small>'
-        )
-        self._log(f"\nERREUR : {msg}")
+        lbl = Gtk.Label()
+        lbl.set_markup(f'<span foreground="#c0392b"><b>✗ Erreur : {msg}</b></span>')
+        lbl.set_xalign(0)
+        lbl.set_line_wrap(True)
+        lbl.set_margin_top(8)
+        self._sync_box.pack_start(lbl, False, False, 0)
+        self._sync_box.show_all()
         self.set_page_complete(self._p_install, True)
         return False
 
@@ -989,7 +1050,6 @@ def _install_desktop_entry():
             f"Type=Application\n"
             f"Categories=Utility;\n"
             f"StartupNotify=false\n"
-            f"X-GNOME-Autostart-enabled=true\n"
         )
     subprocess.run(["update-desktop-database", str(app_dir)], capture_output=True)
 

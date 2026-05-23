@@ -1,6 +1,5 @@
 #!/bin/bash
 # install.sh — Installation du système de synchronisation NAS
-# À lancer UNE FOIS, chez soi, avec le NAS (Cassis.local) monté sur ~/NasShare.
 
 set -e
 
@@ -9,231 +8,290 @@ LOCAL="$HOME/offline_cache"
 NAS="$HOME/NasShare"
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/nas_sync/config.json"
 
-GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
-ok()   { echo -e "${GREEN}✓${NC} $*"; }
-warn() { echo -e "${YELLOW}⚠${NC} $*"; }
-err()  { echo -e "${RED}✗${NC} $*"; exit 1; }
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'
+CYAN='\033[0;36m'; BLUE='\033[0;34m'; PURPLE='\033[0;35m'
+BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
-echo ""
-echo "══════════════════════════════════════════════"
-echo "   NAS Sync — Installation"
-echo "══════════════════════════════════════════════"
-echo ""
+ok()    { echo -e "  ${GREEN}✓${NC} $*"; }
+warn()  { echo -e "  ${YELLOW}⚠${NC} $*"; }
+err()   { echo -e "  ${RED}✗${NC} $*"; exit 1; }
+title() { echo -e "\n${BOLD}${CYAN}● $*${NC}"; }
+dim()   { echo -e "     ${DIM}$*${NC}"; }
 
-# ── Mode d'utilisation ────────────────────────────────────────────────────────
+fmt_bytes() {
+    local b=${1:-0}
+    if   [ "$b" -ge 1073741824 ]; then awk "BEGIN{printf \"%.1f Go\", $b/1073741824}"
+    elif [ "$b" -ge 1048576    ]; then awk "BEGIN{printf \"%.1f Mo\", $b/1048576}"
+    elif [ "$b" -ge 1024       ]; then awk "BEGIN{printf \"%.0f Ko\", $b/1024}"
+    else echo "${b} o"; fi
+}
 
-echo "Mode d'utilisation :"
-echo ""
-echo "  1) PC portable  — cache local + synchronisation hors ligne (défaut)"
-echo "     Vos fichiers sont copiés localement. Accessibles même sans réseau."
-echo "     Synchronisés automatiquement dès la reconnexion au NAS."
-echo ""
-echo "  2) PC fixe      — accès direct au NAS"
-echo "     Vos dossiers pointent directement vers le NAS."
-echo "     Simple et rapide. Le NAS doit être disponible en permanence."
-echo ""
-read -rp "Votre choix [1/2, défaut=1] : " _MODE_CHOICE
+run_with_spinner() {
+    local message="$1"
+    shift
+    # Exécuter la commande en arrière-plan
+    "$@" &
+    local pid=$!
+    
+    # Frames de l'animation de chargement
+    local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local i=0
+    
+    printf "\e[?25l" # Cacher le curseur
+    
+    while kill -0 "$pid" 2>/dev/null; do
+        local frame="${spin:$i:1}"
+        printf "\r  ${GREEN}%s${NC} %s" "$frame" "$message"
+        sleep 0.08
+        i=$(( (i+1) % 10 ))
+    done
+    
+    wait "$pid"
+    local exit_code=$?
+    
+    printf "\e[?25h" # Réafficher le curseur
+    printf "\r\e[K"  # Effacer la ligne courante
+    
+    return $exit_code
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+echo -e ""
+echo -e "  ${BLUE}┌──────────────────────────────────────────────┐${NC}"
+echo -e "  ${BLUE}│${NC}  ${BOLD}${CYAN}          NAS Sync — Installation           ${NC}${BLUE}│${NC}"
+echo -e "  ${BLUE}└──────────────────────────────────────────────┘${NC}"
+echo -e ""
+echo -e "  Ce script va installer et configurer votre système de"
+echo -e "  synchronisation NAS intelligent."
+echo -e ""
+echo -e "  ${DIM}Note : Ce processus interactif nécessite votre attention au début,${NC}"
+echo -e "  ${DIM}puis s'exécutera en tâche de fond pour la copie initiale.${NC}"
+echo -e ""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# QUESTIONS (phase interactive — soyez présent)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+title "① Mode d'utilisation"
+echo -e ""
+echo -e "     ${BOLD}1)${NC} ${GREEN}PC portable${NC}  — cache local + synchronisation automatique  ${CYAN}(Recommandé)${NC}"
+echo -e "        ${DIM}Vos fichiers sont copiés localement dans ~/offline_cache/.${NC}"
+echo -e "        ${DIM}Ils restent accessibles à pleine vitesse même sans réseau.${NC}"
+echo -e "     ${BOLD}2)${NC} ${YELLOW}PC fixe${NC}      — accès direct au NAS"
+echo -e "        ${DIM}Vos dossiers pointent directement vers le NAS monté.${NC}"
+echo -e "        ${DIM}Le NAS doit être joignable en permanence.${NC}"
+echo -e ""
+read -rp "  Votre choix [1/2, défaut=1] : " _MODE_CHOICE
 case "${_MODE_CHOICE}" in
     2) INSTALL_MODE="fixe"     ;;
     *) INSTALL_MODE="portable" ;;
 esac
-ok "Mode : $INSTALL_MODE"
-echo ""
-
-# ── Paramétrage des dossiers à synchroniser ──────────────────────────────────
-
-# Format : "Nom français|local_sub|nas_sub|XDG_KEY|max_age_days"
-DIR_DEFS=(
-    "Bureau|Desktop|Desktop|XDG_DESKTOP_DIR|0"
-    "Téléchargements|Downloads|Downloads|XDG_DOWNLOAD_DIR|90"
-    "Documents|Documents|Documents|XDG_DOCUMENTS_DIR|0"
-    "Musique|Music|Music|XDG_MUSIC_DIR|180"
-    "Images|Pictures|Pictures|XDG_PICTURES_DIR|0"
-    "Vidéos|video|video|XDG_VIDEOS_DIR|90"
-)
-
-SELECTED_DIRS=()
-SELECTED_DIR_LABELS=()
-
-echo "Choix des dossiers à synchroniser :"
-echo "(Entrée = Oui, n = Non)"
-for entry in "${DIR_DEFS[@]}"; do
-    IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
-    read -rp "  Synchroniser '$fr_name' ? [O/n] : " answer
-    case "$answer" in
-        n|N|no|NO|non|NON)
-            warn "$fr_name ignoré"
-            ;;
-        *)
-            SELECTED_DIRS+=("$entry")
-            SELECTED_DIR_LABELS+=("$fr_name")
-            ;;
-    esac
-done
-
-[ ${#SELECTED_DIRS[@]} -gt 0 ] || err "Aucun dossier sélectionné. Installation annulée."
-
-SELECTED_LABELS_JOINED="${SELECTED_DIR_LABELS[*]}"
-ok "Dossiers sélectionnés : $SELECTED_LABELS_JOINED"
-echo ""
-
-# ── Dépendances ───────────────────────────────────────────────────────────────
-
-echo "Vérification des dépendances…"
-
-HAS_RSYNC=false
-
-_dnf_install() {
-    local pkg="$1" desc="$2"
-    echo "  Installation de $pkg…"
-    if sudo dnf install -y "$pkg" &>/dev/null; then
-        ok "$desc installé"
-    else
-        warn "Échec installation $pkg — certaines fonctionnalités seront limitées"
-    fi
-}
-
-# PyGObject GTK3 (obligatoire)
-if ! python3 -c "import gi; gi.require_version('Gtk','3.0'); from gi.repository import Gtk" 2>/dev/null; then
-    _dnf_install python3-gobject "PyGObject GTK3"
-    python3 -c "import gi; gi.require_version('Gtk','3.0'); from gi.repository import Gtk" 2>/dev/null \
-        || err "PyGObject GTK3 toujours absent après installation — vérifiez votre système"
-fi
-ok "PyGObject GTK3"
-
-# AppIndicator3 (optionnel — icône barre système enrichie sur GNOME/KDE/XFCE)
-if python3 -c "import gi; gi.require_version('AppIndicator3','0.1'); from gi.repository import AppIndicator3" 2>/dev/null; then
-    ok "AppIndicator3 (icône barre système native)"
-else
-    warn "AppIndicator3 non disponible — l'app utilisera le fallback standard (Gtk.StatusIcon)"
-    warn "  Pour l'activer sur Fedora/Nobara : sudo dnf install libappindicator-gtk3"
-fi
-
-# notify-send (notifications bureau — fonctionne sur GNOME, KDE, XFCE, Cinnamon…)
-if ! command -v notify-send &>/dev/null; then
-    _dnf_install libnotify "notify-send"
-fi
-command -v notify-send &>/dev/null && ok "notify-send" || warn "notify-send absent"
-
-# rsync (synchro initiale)
-if ! command -v rsync &>/dev/null; then
-    _dnf_install rsync "rsync"
-fi
-if command -v rsync &>/dev/null; then
-    ok "rsync"; HAS_RSYNC=true
-else
-    warn "rsync absent — la synchro initiale sera ignorée"; HAS_RSYNC=false
-fi
+ok "Mode choisi : ${GREEN}${INSTALL_MODE}${NC}"
 
 # ── NAS disponible ? ──────────────────────────────────────────────────────────
 
 echo ""
 if mountpoint -q "$NAS" 2>/dev/null; then
     NAS_OK=true
-    ok "NAS monté sur $NAS"
+    ok "NAS détecté et monté sur ${GREEN}$NAS${NC}"
 else
     NAS_OK=false
-    warn "NAS non monté — la synchronisation initiale sera ignorée"
-    warn "Relancez ce script depuis chez vous pour la copie initiale"
+    warn "NAS non détecté ou non monté — les tailles de fichiers seront indisponibles et la copie initiale sera ignorée"
+fi
+
+# ── Dossiers : sélection + taille + quota ─────────────────────────────────────
+
+title "② Dossiers à synchroniser"
+echo -e ""
+echo -e "  ${DIM}(Appuyez sur Entrée pour valider [Oui], tapez 'n' pour ignorer)${NC}"
+echo -e ""
+
+# Format : "Nom|local_sub|nas_sub|max_age_days"
+DIR_DEFS=(
+    "Bureau|Desktop|Desktop|0"
+    "Téléchargements|Downloads|Downloads|90"
+    "Documents|Documents|Documents|0"
+    "Images|Pictures|Pictures|0"
+    "Musique|Music|Music|180"
+    "Vidéos|video|video|90"
+)
+
+# SELECTED_DIRS entries : "Nom|local_sub|nas_sub|max_age_days|quota_go|nas_bytes"
+SELECTED_DIRS=()
+SELECTED_DIR_LABELS=()
+TOTAL_NAS_BYTES=0
+
+for entry in "${DIR_DEFS[@]}"; do
+    IFS='|' read -r fr_name local_sub nas_sub max_age <<< "$entry"
+
+    # Taille sur le NAS
+    nas_bytes=0
+    nas_size_str=""
+    if [ "$NAS_OK" = true ] && [ -d "$NAS/$nas_sub" ]; then
+        # Create a temp file to store the result because subshell variables aren't preserved in run_with_spinner
+        tmp_size_file=$(mktemp)
+        
+        run_with_spinner "Calcul du volume de '$fr_name' sur le NAS..." du -sb "$NAS/$nas_sub" > "$tmp_size_file" 2>/dev/null
+        
+        nas_bytes=$(awk '{print $1}' "$tmp_size_file" 2>/dev/null)
+        rm -f "$tmp_size_file"
+        nas_bytes=${nas_bytes:-0}
+        nas_size_str=" (${GREEN}$(fmt_bytes "$nas_bytes")${NC} sur le NAS)"
+    fi
+
+    read -rp "  [?] Synchroniser le dossier '$fr_name'$nas_size_str ? [O/n] : " answer
+    case "$answer" in
+        n|N|no|NO|non|NON)
+            echo -e "     ${DIM}→ dossier '$fr_name' ignoré${NC}"
+            continue
+            ;;
+    esac
+
+    # Quota en Go (seulement si NAS disponible et taille connue)
+    quota_go=0
+    if [ "$NAS_OK" = true ] && [ "$nas_bytes" -gt 0 ] && [ "$INSTALL_MODE" = "portable" ]; then
+        avail_kb=$(df -k "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')
+        avail_bytes=$(( ${avail_kb:-0} * 1024 ))
+        if [ "$nas_bytes" -gt "$avail_bytes" ]; then
+            suggested_go=$(awk "BEGIN{printf \"%d\", $avail_bytes*0.8/1073741824}")
+            [ "$suggested_go" -lt 1 ] && suggested_go=1
+            warn "Ce dossier fait $(fmt_bytes $nas_bytes) ; espace libre sur votre PC : $(fmt_bytes $avail_bytes)"
+            read -rp "     $(echo -e "${YELLOW}»${NC}") Définir un quota en Go (0 = illimité, conseillé ≤ ${suggested_go} Go) : " quota_go
+        else
+            read -rp "     $(echo -e "${CYAN}»${NC}") Définir un quota en Go (0 = tout télécharger) : " quota_go
+        fi
+        [[ "$quota_go" =~ ^[0-9]+$ ]] || quota_go=0
+    fi
+
+    if [ "$quota_go" -gt 0 ]; then
+        effective_bytes=$(( quota_go * 1073741824 ))
+        [ "$effective_bytes" -gt "$nas_bytes" ] && effective_bytes=$nas_bytes
+    else
+        effective_bytes=$nas_bytes
+    fi
+    TOTAL_NAS_BYTES=$(( TOTAL_NAS_BYTES + effective_bytes ))
+
+    SELECTED_DIRS+=("$fr_name|$local_sub|$nas_sub|$max_age|$quota_go|$nas_bytes")
+    SELECTED_DIR_LABELS+=("$fr_name")
+    ok "$fr_name${quota_go:+ — quota : ${quota_go} Go}"
+done
+
+[ ${#SELECTED_DIRS[@]} -gt 0 ] || err "Aucun dossier sélectionné. Installation annulée."
+
+# ── Récapitulatif avant de commencer ─────────────────────────────────────────
+
+echo -e ""
+echo -e "  ${BLUE}┌────────────────────────────────────────────────────────┐${NC}"
+echo -e "  ${BLUE}│${NC}                 ${BOLD}${CYAN}Récapitulatif de l'installation${NC}        ${BLUE}│${NC}"
+echo -e "  ${BLUE}├────────────────────────────────────────────────────────┤${NC}"
+echo -e "  ${BLUE}│${NC}  Mode     : ${GREEN}$INSTALL_MODE${NC}"
+echo -e "  ${BLUE}│${NC}  Dossiers : ${YELLOW}${SELECTED_DIR_LABELS[*]}${NC}"
+
+if [ "$NAS_OK" = true ] && [ "$INSTALL_MODE" = "portable" ]; then
+    avail_bytes=$(( $(df -k "$HOME" 2>/dev/null | awk 'NR==2 {print $4}') * 1024 ))
+    echo -e "  ${BLUE}│${NC}  À copier : ${CYAN}$(fmt_bytes $TOTAL_NAS_BYTES)${NC}"
+    echo -e "  ${BLUE}│${NC}  Esp. PC  : $(fmt_bytes $avail_bytes)"
+    echo -e "  ${BLUE}├────────────────────────────────────────────────────────┤${NC}"
+    MARGIN=1073741824
+    if [ "$TOTAL_NAS_BYTES" -gt $(( avail_bytes - MARGIN )) ]; then
+        echo -e "  ${BLUE}│${NC}  ${YELLOW}⚠ Attention : Espace disque local très juste !${NC}"
+        echo -e "  ${BLUE}│${NC}    Il est vivement conseillé de réduire les quotas."
+    else
+        echo -e "  ${BLUE}│${NC}  ${GREEN}✓ Espace disque local suffisant.${NC}"
+    fi
+fi
+echo -e "  ${BLUE}└────────────────────────────────────────────────────────┘${NC}"
+echo -e ""
+read -rp "  [?] Lancer l'installation maintenant ? [O/n] : " _CONFIRM
+case "${_CONFIRM:-o}" in
+    n|N|no|NO|non|NON) echo "  Annulé."; exit 0 ;;
+esac
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 1 : Configuration (automatique, quelques secondes)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+echo -e ""
+echo -e "  ${BLUE}┌──────────────────────────────────────────────┐${NC}"
+echo -e "  ${BLUE}│${NC}   ${BOLD}${CYAN}⚙  Phase 1 : Configuration automatique    ${NC}${BLUE}│${NC}"
+echo -e "  ${BLUE}└──────────────────────────────────────────────┘${NC}"
+echo -e ""
+
+# ── Dépendances ───────────────────────────────────────────────────────────────
+
+_dnf_install() {
+    local pkg="$1" desc="$2"
+    local tmp_err
+    tmp_err=$(mktemp)
+    if run_with_spinner "Installation de $desc ($pkg)..." sudo dnf install -y "$pkg" > /dev/null 2> "$tmp_err"; then
+        ok "$desc installé"
+    else
+        warn "Échec installation $pkg — certaines fonctionnalités seront limitées (voir stderr)"
+        dim "$(cat "$tmp_err" 2>/dev/null)"
+    fi
+    rm -f "$tmp_err"
+}
+
+HAS_RSYNC=false
+
+if ! python3 -c "import gi; gi.require_version('Gtk','3.0'); from gi.repository import Gtk" 2>/dev/null; then
+    _dnf_install python3-gobject "PyGObject GTK3"
+    python3 -c "import gi; gi.require_version('Gtk','3.0'); from gi.repository import Gtk" 2>/dev/null \
+        || err "PyGObject GTK3 introuvable après installation"
+fi
+ok "PyGObject GTK3"
+
+if ! python3 -c "import gi; gi.require_version('AppIndicator3','0.1'); from gi.repository import AppIndicator3" 2>/dev/null; then
+    warn "AppIndicator3 absent — icône barre système en mode dégradé"
+    dim "    (sudo dnf install libappindicator-gtk3 pour l'activer)"
+else
+    ok "AppIndicator3"
+fi
+
+command -v notify-send &>/dev/null || _dnf_install libnotify "notify-send"
+command -v notify-send &>/dev/null && ok "notify-send" || warn "notify-send absent"
+
+if command -v rsync &>/dev/null; then
+    ok "rsync"; HAS_RSYNC=true
+else
+    _dnf_install rsync "rsync"
+    command -v rsync &>/dev/null && { ok "rsync"; HAS_RSYNC=true; } \
+        || warn "rsync absent — sync initiale ignorée"
 fi
 
 # ── Cache local ───────────────────────────────────────────────────────────────
 
-echo ""
-echo "Création du cache local $LOCAL …"
 for entry in "${SELECTED_DIRS[@]}"; do
-    IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
+    IFS='|' read -r fr_name local_sub nas_sub max_age quota_go nas_bytes <<< "$entry"
     mkdir -p "$LOCAL/$local_sub"
 done
-ok "Dossiers créés dans $LOCAL"
-
-# ── Synchro initiale NAS → local ─────────────────────────────────────────────
-
-if [ "$NAS_OK" = true ] && [ "$HAS_RSYNC" = true ] && [ "$INSTALL_MODE" = "portable" ]; then
-    echo ""
-    echo "Synchronisation initiale NAS → cache local …"
-
-    # Calcul de la taille totale
-    total_bytes=0
-    for entry in "${SELECTED_DIRS[@]}"; do
-        IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
-        if [ -d "$NAS/$nas_sub" ]; then
-            sz=$(du -sb "$NAS/$nas_sub" 2>/dev/null | awk '{print $1}')
-            total_bytes=$(( total_bytes + ${sz:-0} ))
-        fi
-    done
-    if [ "$total_bytes" -gt 1073741824 ]; then
-        total_human=$(awk "BEGIN{printf \"%.1f Go\", $total_bytes/1073741824}")
-    elif [ "$total_bytes" -gt 1048576 ]; then
-        total_human=$(awk "BEGIN{printf \"%.1f Mo\", $total_bytes/1048576}")
-    else
-        total_human="${total_bytes} o"
-    fi
-    echo "  Volume total à copier : $total_human"
-
-    # Vérification espace disque (marge de sécurité : 1 Go)
-    available_kb=$(df -k "$LOCAL" 2>/dev/null | awk 'NR==2 {print $4}')
-    needed_kb=$(( total_bytes / 1024 ))
-    margin_kb=1048576
-    if [ -n "$available_kb" ] && [ $(( needed_kb + margin_kb )) -gt "$available_kb" ]; then
-        warn "Espace disque insuffisant pour la synchronisation initiale !"
-        warn "  Nécessaire : $(awk "BEGIN{printf \"%.1f Go\", ($needed_kb+$margin_kb)/1048576}")"
-        warn "  Disponible : $(awk "BEGIN{printf \"%.1f Go\", $available_kb/1048576}")"
-        warn "  Synchronisation initiale ignorée — libérez de l'espace puis relancez install.sh"
-    else
-        echo ""
-        for entry in "${SELECTED_DIRS[@]}"; do
-            IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
-            if [ -d "$NAS/$nas_sub" ]; then
-                nb=$(find "$NAS/$nas_sub" -type f 2>/dev/null | wc -l)
-                sz=$(du -sh "$NAS/$nas_sub" 2>/dev/null | awk '{print $1}')
-                echo "  $fr_name ($nb fichiers, $sz) :"
-                rsync -ah --ignore-existing --info=progress2 \
-                    "$NAS/$nas_sub/" "$LOCAL/$local_sub/" 2>/dev/null || true
-                echo ""
-                ok "$fr_name synchronisé"
-            else
-                warn "$fr_name absent sur le NAS — ignoré"
-            fi
-        done
-    fi
-fi
+ok "Cache local $LOCAL créé"
 
 # ── Liens symboliques ─────────────────────────────────────────────────────────
 
-echo ""
-echo "Mise à jour des liens symboliques …"
-if [ "$INSTALL_MODE" = "fixe" ]; then
-    LINK_BASE="$NAS"
-else
-    LINK_BASE="$LOCAL"
-fi
+[ "$INSTALL_MODE" = "fixe" ] && LINK_BASE="$NAS" || LINK_BASE="$LOCAL"
+
 for entry in "${SELECTED_DIRS[@]}"; do
-    IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
+    IFS='|' read -r fr_name local_sub nas_sub max_age quota_go nas_bytes <<< "$entry"
     link_path="$HOME/$fr_name"
     target="$LINK_BASE/$local_sub"
     mkdir -p "$target"
     if [ -L "$link_path" ]; then
         rm "$link_path"
     elif [ -d "$link_path" ]; then
-        # Déplacer le contenu vers la cible avant de supprimer
         if [ -n "$(ls -A "$link_path" 2>/dev/null)" ]; then
             cp -a "$link_path/." "$target/" 2>/dev/null || true
         fi
-        rmdir "$link_path" 2>/dev/null || { warn "  $link_path non vide — ignoré"; continue; }
+        rmdir "$link_path" 2>/dev/null || { warn "$link_path non vide — ignoré"; continue; }
     fi
     ln -s "$target" "$link_path"
-    ok "  $link_path → $target"
 done
+ok "Liens symboliques créés (→ $LINK_BASE)"
 
-# ── XDG user-dirs (noms français standards, valables quel que soit le mode) ──
+# ── XDG user-dirs ─────────────────────────────────────────────────────────────
 
-echo ""
-echo "Mise à jour de ~/.config/user-dirs.dirs …"
 mkdir -p "$HOME/.config"
-# Les XDG dirs pointent TOUJOURS vers les noms français (~/Bureau, ~/Téléchargements…)
-# qui sont eux-mêmes des liens symboliques vers NAS ou cache local selon le mode.
-# Cela évite les conflits avec xdg-user-dirs-update et fonctionne sur tous les DE.
 cat > "$HOME/.config/user-dirs.dirs" << 'XDGEOF'
 XDG_DESKTOP_DIR="$HOME/Bureau"
 XDG_DOWNLOAD_DIR="$HOME/Téléchargements"
@@ -246,47 +304,36 @@ XDG_VIDEOS_DIR="$HOME/Vidéos"
 XDGEOF
 mkdir -p "$HOME/Modèles" "$HOME/Public"
 xdg-user-dirs-update 2>/dev/null || true
-ok "XDG user-dirs mis à jour (noms français standards)"
+ok "XDG user-dirs (noms français)"
 
-# ── Configuration initiale ────────────────────────────────────────────────────
+# ── Configuration JSON ────────────────────────────────────────────────────────
 
-if [ ! -f "$CONFIG" ]; then
-    echo ""
-    echo "Génération de la configuration initiale…"
-    PYTHONPATH="$SCRIPT_DIR" python3 - << 'PY'
-from nas_sync_config import load_config
-load_config()
-PY
-    ok "Configuration créée : $CONFIG"
-fi
-
-# Enregistrer le mode et les dossiers sélectionnés dans la configuration
-python3 - << PYEOF
-import json
+mkdir -p "$(dirname "$CONFIG")"
+PYTHONPATH="$SCRIPT_DIR" python3 - << PYEOF
+import json, sys
 from pathlib import Path
-cfg_path = Path("$CONFIG")
-if cfg_path.exists():
-    cfg = json.loads(cfg_path.read_text())
-    cfg["mode"] = "$INSTALL_MODE"
-    cfg["dirs"] = [
+from nas_sync_config import load_config, save_config
+
+cfg = load_config()
+cfg["mode"] = "$INSTALL_MODE"
+cfg["dirs"] = [
 $(for entry in "${SELECTED_DIRS[@]}"; do
-    IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
-    echo "        {\"local_sub\": \"$local_sub\", \"nas_sub\": \"$nas_sub\", \"enabled\": True, \"max_age_days\": $max_age},"
+    IFS='|' read -r fr_name local_sub nas_sub max_age quota_go nas_bytes <<< "$entry"
+    quota_mb=$(( quota_go * 1024 ))
+    echo "    {\"local_sub\": \"$local_sub\", \"nas_sub\": \"$nas_sub\", \"enabled\": True, \"max_age_days\": $max_age, \"max_size_mb\": $quota_mb},"
 done)
-    ]
-    cfg_path.write_text(json.dumps(cfg, indent=2))
+]
+save_config(cfg)
 PYEOF
-ok "Mode '$INSTALL_MODE' enregistré dans la configuration"
+ok "Configuration enregistrée ($CONFIG)"
 
-# ── Service systemd (mode portable uniquement) ────────────────────────────────
+# ── Service systemd (portable uniquement) ─────────────────────────────────────
 
-echo ""
 if [ "$INSTALL_MODE" = "portable" ]; then
-    echo "Installation du service systemd …"
     mkdir -p "$HOME/.config/systemd/user"
     cat > "$HOME/.config/systemd/user/nas-sync.service" << EOF
 [Unit]
-Description=NAS Sync Daemon — Synchronisation bidirectionnelle offline_cache ↔ NAS
+Description=NAS Sync Daemon
 After=network.target graphical-session.target
 PartOf=graphical-session.target
 
@@ -303,20 +350,14 @@ WantedBy=graphical-session.target
 EOF
     systemctl --user daemon-reload
     systemctl --user enable nas-sync.service
-    systemctl --user start nas-sync.service
-    sleep 2
-    systemctl --user is-active --quiet nas-sync.service \
-        && ok "Service nas-sync démarré et activé" \
-        || warn "Service démarré (vérifiez avec : systemctl --user status nas-sync)"
+    ok "Service systemd activé"
 else
     ok "Mode PC fixe — service de synchronisation non activé"
 fi
 
-# ── Autostart (XDG standard — fonctionne sur GNOME, KDE, XFCE, Cinnamon…) ────
+# ── Autostart + menu ──────────────────────────────────────────────────────────
 
-echo ""
-echo "Installation du démarrage automatique …"
-mkdir -p "$HOME/.config/autostart"
+mkdir -p "$HOME/.config/autostart" "$HOME/.local/share/applications"
 cat > "$HOME/.config/autostart/nas-sync-app.desktop" << EOF
 [Desktop Entry]
 Name=NAS Sync
@@ -327,44 +368,144 @@ Type=Application
 Categories=Utility;Network;
 StartupNotify=false
 EOF
-# Entrée dans le menu des applications
-mkdir -p "$HOME/.local/share/applications"
 cp "$HOME/.config/autostart/nas-sync-app.desktop" \
    "$HOME/.local/share/applications/nas-sync.desktop" 2>/dev/null || true
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
-ok "Démarrage automatique configuré"
+ok "Démarrage automatique + menu applications"
 
-# Lancer l'interface immédiatement (si session graphique active)
+echo -e ""
+ok "Phase 1 terminée avec succès !"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 2 : Synchronisation initiale (peut prendre du temps)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+echo -e ""
+echo -e "  ${BLUE}┌──────────────────────────────────────────────┐${NC}"
+echo -e "  ${BLUE}│${NC}   ${BOLD}${CYAN}🔄  Phase 2 : Synchronisation initiale      ${NC}${BLUE}│${NC}"
+echo -e "  ${BLUE}└──────────────────────────────────────────────┘${NC}"
+echo -e ""
+
+if [ "$NAS_OK" != true ] || [ "$HAS_RSYNC" != true ] || [ "$INSTALL_MODE" != "portable" ]; then
+    if [ "$INSTALL_MODE" != "portable" ]; then
+        ok "Mode PC fixe — aucun cache local à alimenter"
+    elif [ "$NAS_OK" != true ]; then
+        warn "NAS non joignable — synchronisation initiale ignorée"
+        dim "Relancez l'installation depuis votre réseau local pour copier vos fichiers."
+    else
+        warn "rsync absent — synchronisation initiale ignorée"
+    fi
+else
+    dim "Vous pouvez laisser tourner et fermer ce terminal si vous le souhaitez."
+    dim "Le démon prendra automatiquement le relais une fois terminé."
+    echo ""
+
+    for entry in "${SELECTED_DIRS[@]}"; do
+        IFS='|' read -r fr_name local_sub nas_sub max_age quota_go nas_bytes <<< "$entry"
+        src="$NAS/$nas_sub"
+        dst="$LOCAL/$local_sub"
+
+        [ -d "$src" ] || { warn "Dossier '$fr_name' absent sur le NAS — ignoré"; continue; }
+
+        # Taille effective (avec quota si défini)
+        if [ "$quota_go" -gt 0 ]; then
+            effective_bytes=$(( quota_go * 1073741824 ))
+            [ "$effective_bytes" -gt "$nas_bytes" ] && effective_bytes=$nas_bytes
+            size_label="quota ${quota_go} Go"
+            max_size_arg="--max-size=${quota_go}g"
+        else
+            effective_bytes=$nas_bytes
+            size_label="$(fmt_bytes $effective_bytes)"
+            max_size_arg=""
+        fi
+
+        echo -e "  ${BOLD}${CYAN}»${NC} Synchronisation de : ${BOLD}$fr_name${NC} ($size_label)"
+        rsync -ah --ignore-existing --info=progress2 $max_size_arg \
+            "$src/" "$dst/" 2>/dev/null | \
+            awk -v fr="$fr_name" '
+            {
+                # Extraire le pourcentage
+                pct = 0
+                if (match($0, /[0-9]+%/)) {
+                    pct = substr($0, RSTART, RLENGTH - 1) + 0
+                }
+                
+                # Extraire la vitesse
+                speed = "0 Ko/s"
+                if (match($0, /[0-9]+(\.[0-9]+)?[a-zA-Z]+B\/s/)) {
+                    speed = substr($0, RSTART, RLENGTH)
+                }
+                
+                # Extraire la taille transférée
+                size = $1
+                
+                # Extraire le temps restant (ETA)
+                eta = "--:--:--"
+                if (match($0, /[0-9]+:[0-9]+:[0-9]+/)) {
+                    eta = substr($0, RSTART, RLENGTH)
+                }
+                
+                # Générer la barre de progression (longueur 20)
+                filled = int(pct / 5)
+                bar = ""
+                for (i = 1; i <= 20; i++) {
+                    if (i <= filled) {
+                        bar = bar "\033[0;32m█\033[0m"
+                    } else {
+                        bar = bar "\033[2m░\033[0m"
+                    }
+                }
+                
+                # Affichage formaté
+                printf "\r    %-16s  [%s]  \033[1;32m%3d%%\033[0m  (%s, %s, rest. %s)   ", 
+                       fr, bar, pct, size, speed, eta
+                fflush()
+            }
+            END {
+                # Afficher la ligne finale à 100%
+                filled = 20
+                bar = ""
+                for (i = 1; i <= 20; i++) bar = bar "\033[0;32m█\033[0m"
+                printf "\r    %-16s  [%s]  \033[1;32m100%%\033[0m                                 \n", fr, bar
+            }
+            ' || true
+        ok "$fr_name synchronisé avec succès"
+        echo ""
+    done
+fi
+
+# ── Démarrer le démon ─────────────────────────────────────────────────────────
+
+if [ "$INSTALL_MODE" = "portable" ]; then
+    systemctl --user start nas-sync.service 2>/dev/null
+    sleep 1
+    systemctl --user is-active --quiet nas-sync.service \
+        && ok "Démon NAS Sync démarré et actif" \
+        || warn "Démon démarré (vérifiez avec : systemctl --user status nas-sync)"
+fi
+
+# Lancer l'interface immédiatement si session graphique
 if [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
     python3 "$SCRIPT_DIR/nas_sync_app.py" &
-    ok "Interface lancée (icône dans la barre système)"
+    ok "Interface de contrôle lancée (icône dans la barre système)"
 fi
 
 # ── Résumé ────────────────────────────────────────────────────────────────────
 
-echo ""
-echo "══════════════════════════════════════════════"
-echo "   Installation terminée !"
-echo "══════════════════════════════════════════════"
-echo ""
-echo "  Mode            : $INSTALL_MODE"
+echo -e ""
+echo -e "  ${GREEN}┌──────────────────────────────────────────────┐${NC}"
+echo -e "  ${GREEN}│${NC}   ${BOLD}${GREEN}🎉   Félicitations, installation terminée !  ${NC}${GREEN}│${NC}"
+echo -e "  ${GREEN}└──────────────────────────────────────────────┘${NC}"
+echo -e ""
+echo -e "  ${BOLD}Mode sélectionné :${NC} ${GREEN}$INSTALL_MODE${NC}"
+echo -e "  ${BOLD}Dossiers configurés :${NC} ${YELLOW}${SELECTED_DIR_LABELS[*]}${NC}"
+echo -e ""
 if [ "$INSTALL_MODE" = "portable" ]; then
-echo "  Cache local     : $LOCAL"
-echo "  Dossiers        : ${SELECTED_LABELS_JOINED}"
-echo "                    → liens symboliques vers le cache local"
-echo "                    → synchronisés automatiquement avec le NAS"
-echo ""
-echo "  Commandes utiles :"
-echo "    Statut démon       : systemctl --user status nas-sync"
-echo "    Logs               : tail -f \${XDG_CACHE_HOME:-\$HOME/.cache}/nas_sync/daemon.log"
-echo "    Activer/désactiver : bash $SCRIPT_DIR/toggle.sh"
-else
-echo "  Dossiers        : ${SELECTED_LABELS_JOINED}"
-echo "                    → pointent directement vers le NAS ($NAS)"
-echo "                    (le NAS doit être monté pour accéder aux fichiers)"
+echo -e "  ${BOLD}Commandes utiles :${NC}"
+echo -e "    ${CYAN}• Statut du démon :${NC}  systemctl --user status nas-sync"
+echo -e "    ${CYAN}• Consulter les logs :${NC} tail -f \${XDG_CACHE_HOME:-\$HOME/.cache}/nas_sync/daemon.log"
+echo -e "    ${CYAN}• Activer / Suspendre :${NC} bash $SCRIPT_DIR/toggle.sh"
 fi
-echo ""
-echo "  Interface       : icône dans la barre système"
-echo "                    Démarre automatiquement à chaque login"
-echo "                    Pour changer de mode : Paramètres → onglet Mode"
-echo ""
+echo -e "  ${BOLD}Note :${NC} L'application démarrera automatiquement à chaque ouverture de session."
+echo -e "         Vous pouvez ajuster les filtres et les quotas dans les Paramètres de la barre système."
+echo -e ""

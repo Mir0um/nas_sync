@@ -250,7 +250,8 @@ class RecentWindow(Gtk.Window):
         self.refresh()
 
     def do_destroy(self):
-        GLib.source_remove(self._timer)
+        if hasattr(self, "_timer"):
+            GLib.source_remove(self._timer)
         Gtk.Window.do_destroy(self)
 
 
