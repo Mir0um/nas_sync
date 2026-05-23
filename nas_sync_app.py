@@ -534,49 +534,25 @@ class SettingsWindow(Gtk.Window):
         vbox.set_border_width(24)
 
         title = Gtk.Label()
-        title.set_markup("<b>Mode d'utilisation</b>")
+        title.set_markup("<b>Mode de synchronisation</b>")
         title.set_xalign(0)
         vbox.pack_start(title, False, False, 0)
 
-        current = self._cfg.get("mode", "portable")
-
-        self._radio_portable = Gtk.RadioButton.new_with_label(
-            None, "PC portable — cache local + synchronisation automatique"
+        info = Gtk.Label()
+        info.set_markup(
+            "La synchronisation est <b>entièrement automatique</b>.\n\n"
+            "<b>Réseau local (NAS accessible) :</b>\n"
+            "  Les fichiers modifiés sont synchronisés automatiquement.\n\n"
+            "<b>Hors réseau local (déconnecté ou autre réseau) :</b>\n"
+            "  Le daemon attend le retour sur le réseau local.\n"
+            "  Aucune action requise de votre part.\n\n"
+            "Vos dossiers (Bureau, Documents, Images…) pointent toujours\n"
+            "vers <tt>~/offline_cache/</tt> et restent accessibles en toutes\n"
+            "circonstances, avec ou sans NAS."
         )
-        self._radio_fixe = Gtk.RadioButton.new_with_label_from_widget(
-            self._radio_portable, "PC fixe — accès direct au NAS"
-        )
-        if current == "fixe":
-            self._radio_fixe.set_active(True)
-        else:
-            self._radio_portable.set_active(True)
-
-        for radio, desc in [
-            (self._radio_portable,
-             "Vos fichiers sont copiés localement (~/offline_cache/).\n"
-             "Accessibles même sans réseau. Synchronisés automatiquement à la reconnexion."),
-            (self._radio_fixe,
-             "Vos dossiers pointent directement vers le NAS.\n"
-             "Simple et rapide. Le NAS doit être accessible en permanence.\n"
-             "La synchronisation est désactivée."),
-        ]:
-            vbox.pack_start(radio, False, False, 0)
-            lbl = Gtk.Label(label=desc)
-            lbl.set_xalign(0)
-            lbl.set_margin_start(28)
-            lbl.set_line_wrap(True)
-            vbox.pack_start(lbl, False, False, 0)
-            vbox.pack_start(Gtk.Separator(), False, False, 4)
-
-        warn = Gtk.Label()
-        warn.set_markup(
-            "<small><i>⚠  Changer de mode met à jour les liens symboliques et "
-            "reconfigure le service.\nUn redémarrage de session peut être nécessaire "
-            "pour que les dossiers soient pris en compte.</i></small>"
-        )
-        warn.set_xalign(0)
-        warn.set_line_wrap(True)
-        vbox.pack_start(warn, False, False, 0)
+        info.set_xalign(0)
+        info.set_line_wrap(True)
+        vbox.pack_start(info, False, False, 0)
 
         return self._wrap(vbox)
 
@@ -772,20 +748,16 @@ class SettingsWindow(Gtk.Window):
             for row in self._extra_nas_store
         ]
 
-        old_mode   = self._cfg.get("mode", "portable")
-        cfg["mode"] = "fixe" if self._radio_fixe.get_active() else "portable"
+        cfg["mode"] = "portable"
 
         save_config(cfg)
 
-        if cfg["mode"] != old_mode:
-            _apply_mode_switch(cfg["mode"], cfg)
-        else:
-            pid = get_daemon_pid()
-            if pid:
-                try:
-                    os.kill(pid, signal.SIGHUP)
-                except OSError:
-                    pass
+        pid = get_daemon_pid()
+        if pid:
+            try:
+                os.kill(pid, signal.SIGHUP)
+            except OSError:
+                pass
 
         self.destroy()
         if self._on_saved:
@@ -968,8 +940,10 @@ class NasSyncApp:
                              if cur else f"  En cours ({done}/{total})")
             elif status == "pause":
                 label = "  ⏸ En pause (batterie / réseau)"
+            elif status == "hors ligne":
+                label = "  Hors réseau local — en attente"
             elif status in ("idle", "arrêté", ""):
-                label = "  Inactif"
+                label = "  ✓ Synchronisé"
             else:
                 label = f"  {status.capitalize()}"
             self._item_progress.set_label(label)
@@ -999,6 +973,13 @@ def main():
             run_wizard(on_done=_on_done)
             if not _done[0]:
                 return  # assistant annulé par l'utilisateur
+
+    # Migration : si l'ancien mode "fixe" était actif, basculer en automatique
+    cfg = load_config()
+    if cfg.get("mode") == "fixe":
+        cfg["mode"] = "portable"
+        save_config(cfg)
+        _apply_mode_switch("portable", cfg)
 
     app = NasSyncApp()
     if not is_daemon_running():

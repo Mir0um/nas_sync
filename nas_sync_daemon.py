@@ -188,6 +188,41 @@ def nas_available() -> bool:
     return True
 
 
+# ── commutation des liens symboliques (mode fixe) ─────────────────────────────
+
+_FR_LINKS = {
+    "Desktop":   "Bureau",
+    "Downloads": "Téléchargements",
+    "Documents": "Documents",
+    "Pictures":  "Images",
+    "Music":     "Musique",
+    "video":     "Vidéos",
+}
+
+
+def _switch_symlinks(to_nas: bool) -> None:
+    """Redirige les liens symboliques XDG vers le NAS ou le cache local."""
+    if cfg.get("mode", "portable") != "fixe":
+        return
+    active_subs = {d["local_sub"] for d in cfg["dirs"] if d.get("enabled", True)}
+    nas_mount   = Path(cfg["nas_mount"])
+    cache_base  = Path(cfg.get("local_base", str(Path.home() / "offline_cache")))
+    home        = Path.home()
+    for local_sub, fr_name in _FR_LINKS.items():
+        if local_sub not in active_subs:
+            continue
+        target = (nas_mount if to_nas else cache_base) / local_sub
+        link   = home / fr_name
+        try:
+            if link.is_symlink():
+                link.unlink()
+            if not link.exists():
+                link.symlink_to(target)
+                log.info(f"Lien ~/{fr_name} → {target}")
+        except OSError as exc:
+            log.warning(f"Impossible de mettre à jour le lien ~/{fr_name} : {exc}")
+
+
 # ── fix 7 : décalage horloge NAS ─────────────────────────────────────────────
 
 def measure_clock_offset() -> float:
@@ -840,6 +875,12 @@ def main():
     was_up      = False
     last_sync_t = 0.0
 
+    # Vérification initiale : état réseau connu dès le démarrage
+    _initial_up = nas_available()
+    _switch_symlinks(to_nas=_initial_up)
+    if not _initial_up:
+        write_progress("hors ligne")
+
     try:
         while True:
             if _reload_cfg:
@@ -865,6 +906,7 @@ def main():
                 if not was_up and up:
                     log.info("NAS connecté → synchronisation")
                     notify("NAS Sync", "NAS connecté — synchronisation en cours…")
+                    _switch_symlinks(to_nas=True)
                 do_sync()
                 last_sync_t = time.time()
                 _force_sync = False
@@ -877,6 +919,7 @@ def main():
                 log.info("NAS hors ligne — mode hors connexion")
                 notify("NAS Sync", "NAS hors ligne — mode local actif")
                 write_progress("hors ligne")
+                _switch_symlinks(to_nas=False)
 
             was_up = up
             time.sleep(cfg.get("check_interval", 30))
