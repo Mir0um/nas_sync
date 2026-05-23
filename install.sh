@@ -122,6 +122,31 @@ DIR_DEFS=(
     "Vidéos|video|video|90"
 )
 
+# ── Pré-calcul des tailles NAS en parallèle ──────────────────────────────────
+# Tous les scans démarrent immédiatement ; la boucle interactive n'attend que
+# le dossier courant, et les autres sont déjà prêts quand on y arrive.
+declare -A _NAS_SIZE_FILE  # nas_sub → chemin du fichier résultat
+declare -A _NAS_SIZE_PID   # nas_sub → PID du sous-shell de calcul
+
+if [ "$NAS_OK" = true ]; then
+    dim "Calcul des volumes NAS en cours (arrière-plan)…"
+    for _entry in "${DIR_DEFS[@]}"; do
+        IFS='|' read -r _fn _ls _nas_sub _ma <<< "$_entry"
+        if [ -d "$NAS/$_nas_sub" ]; then
+            _tmpf=$(mktemp /tmp/nassync_sz_XXXXXX)
+            _NAS_SIZE_FILE["$_nas_sub"]="$_tmpf"
+            # find -printf : une seule passe, évite les stat() de répertoires de du
+            ( find "$NAS/$_nas_sub" -type f -printf "%s\n" 2>/dev/null \
+                | awk '{s+=$1}END{print s+0}' > "$_tmpf" ) &
+            _NAS_SIZE_PID["$_nas_sub"]=$!
+        fi
+    done
+fi
+
+# Nettoyage des fichiers temporaires à la sortie du script (normal ou Ctrl+C)
+_cleanup_sz() { rm -f "${_NAS_SIZE_FILE[@]}" 2>/dev/null; }
+trap '_cleanup_sz' EXIT INT TERM
+
 # SELECTED_DIRS entries : "Nom|local_sub|nas_sub|max_age_days|quota_go|nas_bytes"
 SELECTED_DIRS=()
 SELECTED_DIR_LABELS=()
@@ -130,13 +155,19 @@ TOTAL_NAS_BYTES=0
 for entry in "${DIR_DEFS[@]}"; do
     IFS='|' read -r fr_name local_sub nas_sub max_age <<< "$entry"
 
-    # Taille sur le NAS
+    # Taille sur le NAS — attendre uniquement ce dossier (les autres continuent)
     nas_bytes=0
     nas_size_str=""
     if [ "$NAS_OK" = true ] && [ -d "$NAS/$nas_sub" ]; then
-        nas_bytes_line=$(run_with_spinner "Calcul du volume de '$fr_name' sur le NAS..." du -sb "$NAS/$nas_sub")
-        nas_bytes=$(echo "$nas_bytes_line" | awk '{print $1}')
-        nas_bytes=${nas_bytes:-0}
+        _pid="${_NAS_SIZE_PID[$nas_sub]:-}"
+        _tmpf="${_NAS_SIZE_FILE[$nas_sub]:-}"
+        if [ -n "$_pid" ]; then
+            wait "$_pid" 2>/dev/null || true
+        fi
+        if [ -n "$_tmpf" ] && [ -f "$_tmpf" ]; then
+            nas_bytes=$(cat "$_tmpf")
+            nas_bytes=${nas_bytes:-0}
+        fi
         nas_size_str=" (${GREEN}$(fmt_bytes "$nas_bytes")${NC} sur le NAS)"
     fi
 

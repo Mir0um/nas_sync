@@ -339,6 +339,7 @@ def _is_too_old(mtime: float, max_age_days: int) -> bool:
 
 
 def scan_local() -> dict:
+    """Retourne {clé: (mtime, size)} pour tous les fichiers du cache local."""
     result = {}
     base = Path(cfg["local_base"])
     for d in cfg["dirs"]:
@@ -351,16 +352,25 @@ def scan_local() -> dict:
         for f in sub.rglob("*"):
             if not f.is_file():
                 continue
-            if is_excluded(f.name):        # fix 5
+            if is_excluded(f.name):
                 continue
-            mt = get_mtime(f)
+            try:
+                st = f.stat()
+                mt, sz = st.st_mtime, st.st_size
+            except Exception:
+                continue
             if _is_too_old(mt, max_age):
                 continue
-            result[f"{d['local_sub']}/{f.relative_to(sub)}"] = mt
+            result[f"{d['local_sub']}/{f.relative_to(sub)}"] = (mt, sz)
     return result
 
 
 def scan_nas() -> dict:
+    """Retourne {clé: (mtime, size)} pour tous les fichiers du NAS.
+
+    Utilise ``find -printf`` en priorité (une seule passe réseau) avec un
+    fallback sur rglob+stat si find échoue.
+    """
     result = {}
     mount = Path(cfg["nas_mount"])
     for d in cfg["dirs"]:
@@ -369,18 +379,46 @@ def scan_nas() -> dict:
         sub = mount / d["nas_sub"]
         if not sub.exists():
             continue
-        max_age = d.get("max_age_days", 0)
+        max_age  = d.get("max_age_days", 0)
+        local_sub = d["local_sub"]
+
+        # Passe unique via find : évite un stat() réseau par fichier
+        try:
+            r = subprocess.run(
+                ["find", str(sub), "-type", "f", "-printf", r"%T@ %s %P\n"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    parts = line.split(" ", 2)
+                    if len(parts) != 3:
+                        continue
+                    mt_raw = float(parts[0])
+                    sz     = int(parts[1])
+                    rel    = parts[2]
+                    if is_excluded(os.path.basename(rel)):
+                        continue
+                    if _is_too_old(mt_raw, max_age):
+                        continue
+                    result[f"{local_sub}/{rel}"] = (mt_raw - _clock_offset, sz)
+                continue
+        except Exception:
+            pass
+
+        # Fallback : rglob + stat (un appel réseau par fichier)
         for f in sub.rglob("*"):
             if not f.is_file():
                 continue
-            if is_excluded(f.name):        # fix 5
+            if is_excluded(f.name):
                 continue
-            mt = get_mtime(f)
+            try:
+                st = f.stat()
+                mt, sz = st.st_mtime, st.st_size
+            except Exception:
+                continue
             if _is_too_old(mt, max_age):
                 continue
-            # fix 7 : correction du décalage horloge NAS
-            adjusted = mt - _clock_offset
-            result[f"{d['local_sub']}/{f.relative_to(sub)}"] = adjusted
+            result[f"{local_sub}/{f.relative_to(sub)}"] = (mt - _clock_offset, sz)
     return result
 
 
@@ -464,8 +502,10 @@ def do_sync() -> int:
     write_progress("analyse", "", 0, total)  # fix 6
 
     for key in all_keys:
-        l_mt = l_f.get(key)
-        n_mt = n_f.get(key)
+        l_info = l_f.get(key)
+        n_info = n_f.get(key)
+        l_mt = l_info[0] if l_info is not None else None
+        n_mt = n_info[0] if n_info is not None else None
         s_mt = state.get(key)
 
         if l_mt is not None and n_mt is not None:
@@ -543,8 +583,9 @@ def do_sync() -> int:
         sub    = d["local_sub"]
         budget = max_mb * 1_048_576
         # Tous les fichiers NAS de ce dossier, triés du plus récent au plus ancien
+        # Taille lue directement depuis le scan — aucun stat() réseau supplémentaire
         dir_files = sorted(
-            [(k, n_f[k], get_size(nas_path(k))) for k in n_f if k.startswith(sub + "/")],
+            [(k, n_f[k][0], n_f[k][1]) for k in n_f if k.startswith(sub + "/")],
             key=lambda x: x[1], reverse=True,
         )
         cumul, in_q = 0, set()
@@ -566,12 +607,12 @@ def do_sync() -> int:
     total_ops = len(to_nas) + len(to_local) + len(del_from_nas) + len(del_from_local) + len(conflicts)
     op        = 0
 
-    bytes_total = (sum(get_size(local_path(k)) for k in to_nas) +
-                   sum(get_size(nas_path(k))   for k in to_local))
+    bytes_total = (sum(l_f[k][1] for k in to_nas) +
+                   sum(n_f[k][1] for k in to_local))
     bytes_done  = 0
 
     # ── vérification espace disque avant copie NAS → local ───────────────────
-    needed_local = sum(get_size(nas_path(k)) for k in to_local)
+    needed_local = sum(n_f[k][1] for k in to_local)
     available    = free_bytes(cfg["local_base"])
     if needed_local > 0 and available < needed_local + SPACE_MARGIN:
         short = needed_local + SPACE_MARGIN - available
@@ -589,7 +630,7 @@ def do_sync() -> int:
     for key in to_nas:
         op += 1
         src        = local_path(key)
-        file_bytes = get_size(src)
+        file_bytes = l_f[key][1]
         write_progress("synchro", key, op, total_ops, bytes_done, bytes_total)
         if safe_copy(src, nas_path(key), do_backup=do_bk):
             new_state[key] = get_mtime(nas_path(key))
@@ -603,7 +644,7 @@ def do_sync() -> int:
     for key in to_local:
         op += 1
         src        = nas_path(key)
-        file_bytes = get_size(src)
+        file_bytes = n_f[key][1]
         write_progress("synchro", key, op, total_ops, bytes_done, bytes_total)
         if safe_copy(src, local_path(key), do_backup=do_bk):
             new_state[key] = get_mtime(local_path(key))

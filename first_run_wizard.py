@@ -896,21 +896,25 @@ class SetupWizard(Gtk.Assistant):
             GLib.idle_add(self._close_hint.show)
 
             # Vérifier l'espace disque total estimé
+            # Réutilise les tailles déjà scannées par le wizard — évite un du -sb réseau par dossier
             total_bytes = 0
             dir_sizes   = {}
             for d in dirs:
-                nas_dir = nas_mnt / d.get("nas_sub", d["local_sub"])
+                sub     = d["local_sub"]
+                max_mb  = d.get("max_size_mb", 0)
+                nas_dir = nas_mnt / d.get("nas_sub", sub)
                 if nas_dir.is_dir():
-                    # Tenir compte du quota Go si défini
-                    max_mb = d.get("max_size_mb", 0)
-                    try:
-                        r2 = subprocess.run(["du", "-sb", str(nas_dir)],
-                                            capture_output=True, text=True, timeout=30)
-                        full_sz = int(r2.stdout.split()[0]) if r2.returncode == 0 else 0
-                    except Exception:
-                        full_sz = 0
+                    full_sz = self._nas_dir_sizes.get(sub)
+                    if full_sz is None:
+                        # Fallback si le scan wizard n'a pas couvert ce dossier
+                        try:
+                            r2 = subprocess.run(["du", "-sb", str(nas_dir)],
+                                                capture_output=True, text=True, timeout=30)
+                            full_sz = int(r2.stdout.split()[0]) if r2.returncode == 0 else 0
+                        except Exception:
+                            full_sz = 0
                     capped = min(full_sz, max_mb * 1_048_576) if max_mb > 0 else full_sz
-                    dir_sizes[d["local_sub"]] = capped
+                    dir_sizes[sub] = capped
                     total_bytes += capped
 
             avail  = shutil.disk_usage(str(Path.home() / "offline_cache")).free
@@ -949,20 +953,44 @@ class SetupWizard(Gtk.Assistant):
                     # d'abord) dont le cumul ne dépasse pas le budget quota.
                     budget = max_mb * 1_048_576
                     all_files = []
-                    for f in src.rglob("*"):
-                        if f.is_file():
-                            try:
-                                st = f.stat()
-                                all_files.append((f.relative_to(src), st.st_mtime, st.st_size))
-                            except OSError:
-                                pass
+
+                    # find -printf : une seule passe réseau (mtime + taille + chemin)
+                    # au lieu d'un stat() par fichier via rglob
+                    try:
+                        r_find = subprocess.run(
+                            ["find", str(src), "-type", "f",
+                             "-printf", r"%T@ %s %P\n"],
+                            capture_output=True, text=True, timeout=120,
+                        )
+                        if r_find.returncode == 0:
+                            for line in r_find.stdout.splitlines():
+                                parts = line.split(" ", 2)
+                                if len(parts) == 3:
+                                    all_files.append(
+                                        (parts[2], float(parts[0]), int(parts[1]))
+                                    )
+                    except Exception:
+                        pass
+
+                    if not all_files:
+                        # Fallback : rglob + stat (lent sur réseau)
+                        for f in src.rglob("*"):
+                            if f.is_file():
+                                try:
+                                    st = f.stat()
+                                    all_files.append(
+                                        (str(f.relative_to(src)), st.st_mtime, st.st_size)
+                                    )
+                                except OSError:
+                                    pass
+
                     all_files.sort(key=lambda x: x[1], reverse=True)
                     cumul = 0
                     selected = []
                     for rel, _mt, sz in all_files:
                         if cumul + sz > budget:
                             continue
-                        selected.append(str(rel))
+                        selected.append(rel)
                         cumul += sz
                     # Écrire la liste dans un fichier temporaire
                     import tempfile
