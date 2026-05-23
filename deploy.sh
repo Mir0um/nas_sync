@@ -14,6 +14,11 @@
 
 set -euo pipefail
 
+# ── Version ───────────────────────────────────────────────────────────────────
+
+APP_VERSION="1.0.0"
+APP_VERSION_NAME="Cassis"
+
 # ── Valeurs par défaut ────────────────────────────────────────────────────────
 
 NAS_HOST="Cassis.local"
@@ -69,7 +74,7 @@ done
 
 echo ""
 echo "══════════════════════════════════════════════════════"
-echo "   NAS Sync — Déploiement entreprise"
+echo "   NAS Sync — Déploiement entreprise  (v${APP_VERSION} — ${APP_VERSION_NAME})"
 echo "══════════════════════════════════════════════════════"
 echo ""
 

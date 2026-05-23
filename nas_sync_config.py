@@ -7,6 +7,9 @@ import shutil
 import time
 from pathlib import Path
 
+APP_VERSION      = "1.0.0"
+APP_VERSION_NAME = "Cassis"
+
 HOME = Path.home()
 UID = os.getuid()
 

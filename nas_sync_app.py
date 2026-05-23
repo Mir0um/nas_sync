@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from nas_sync_config import (
     load_config, save_config, read_events, read_progress,
     is_daemon_running, get_daemon_pid,
+    APP_VERSION, APP_VERSION_NAME,
 )
 
 import gi
@@ -855,6 +856,10 @@ class NasSyncApp:
 
         menu.append(Gtk.SeparatorMenuItem())
 
+        item_about = Gtk.MenuItem(label=f"À propos  (v{APP_VERSION} — {APP_VERSION_NAME})")
+        item_about.connect("activate", lambda _: self._show_about())
+        menu.append(item_about)
+
         item_quit = Gtk.MenuItem(label="Quitter l'interface")
         item_quit.connect("activate", lambda _: Gtk.main_quit())
         menu.append(item_quit)
@@ -868,6 +873,15 @@ class NasSyncApp:
         self._menu.popup(None, None, Gtk.StatusIcon.position_menu, icon, button, time)
 
     # ── actions ───────────────────────────────────────────────────────────────
+
+    def _show_about(self):
+        dlg = Gtk.AboutDialog()
+        dlg.set_program_name("NAS Sync")
+        dlg.set_version(f"{APP_VERSION}  —  {APP_VERSION_NAME}")
+        dlg.set_comments("Synchronisation intelligente entre votre NAS et votre cache local.")
+        dlg.set_license_type(Gtk.License.MIT_X11)
+        dlg.run()
+        dlg.destroy()
 
     def _show_recent(self):
         # fix 14 : nouvelle instance à chaque fois (fenêtre se destroy seule)

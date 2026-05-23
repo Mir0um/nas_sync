@@ -3,6 +3,9 @@
 
 set -e
 
+APP_VERSION="1.0.0"
+APP_VERSION_NAME="Cassis"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL="$HOME/offline_cache"
 NAS="$HOME/NasShare"
@@ -61,6 +64,7 @@ DISCONNECT_NAS=false
 echo -e ""
 echo -e "  ${BLUE}┌──────────────────────────────────────────────┐${NC}"
 echo -e "  ${BLUE}│${NC}  ${BOLD}${CYAN}         NAS Sync — Désinstallation         ${NC}${BLUE}│${NC}"
+echo -e "  ${BLUE}│${NC}  ${DIM}       v${APP_VERSION}  ·  \"${APP_VERSION_NAME}\"                ${NC}${BLUE}│${NC}"
 echo -e "  ${BLUE}└──────────────────────────────────────────────┘${NC}"
 echo -e ""
 echo -e "  Ce script va désinstaller complètement votre système de"
