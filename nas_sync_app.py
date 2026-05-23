@@ -332,7 +332,7 @@ class SettingsWindow(Gtk.Window):
             "<small>"
             "<b>Âge max (j)</b> = 0 → tous les fichiers. Sinon : ignorer les fichiers "
             "non modifiés depuis N jours.\n"
-            "<b>Taille max (Mo)</b> = 0 → pas de limite. Sinon : ne garder dans le cache local "
+            "<b>Taille max (Go)</b> = 0 → pas de limite. Sinon : ne garder dans le cache local "
             "que les fichiers les plus récents qui rentrent dans ce volume. "
             "Les plus anciens sont supprimés automatiquement (sauvegardés si l'option est active)."
             "</small>"
@@ -347,7 +347,7 @@ class SettingsWindow(Gtk.Window):
                 d.get("local_sub", ""),
                 d.get("nas_sub", ""),
                 int(d.get("max_age_days", 0)),
-                int(d.get("max_size_mb", 0)),
+                int(d.get("max_size_mb", 0)) // 1024,
             ])
         tv = Gtk.TreeView(model=self._dirs_store); tv.set_rules_hint(True)
 
@@ -370,12 +370,12 @@ class SettingsWindow(Gtk.Window):
         tv.append_column(Gtk.TreeViewColumn("Âge max (j)", r_spin, text=3))
 
         r_size = Gtk.CellRendererSpin()
-        r_size.set_property("adjustment", Gtk.Adjustment(value=0, lower=0, upper=1_000_000, step_increment=1024))
+        r_size.set_property("adjustment", Gtk.Adjustment(value=0, lower=0, upper=10_000, step_increment=1))
         r_size.set_property("editable", True)
         r_size.connect("edited", lambda _r, p, t: self._dirs_store.__setitem__(
             p, list(self._dirs_store[p])[:4] + [int(t or 0)]
         ))
-        col_size = Gtk.TreeViewColumn("Taille max (Mo, 0=∞)", r_size, text=4)
+        col_size = Gtk.TreeViewColumn("Taille max (Go, 0=∞)", r_size, text=4)
         col_size.set_min_width(130)
         tv.append_column(col_size)
 
@@ -733,7 +733,7 @@ class SettingsWindow(Gtk.Window):
                 "local_sub":    row[1],
                 "nas_sub":      row[2],
                 "max_age_days": row[3],
-                "max_size_mb":  row[4],
+                "max_size_mb":  row[4] * 1024,
             }
             for row in self._dirs_store
         ]

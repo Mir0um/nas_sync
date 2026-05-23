@@ -37,11 +37,11 @@ run_with_spinner() {
     local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
     local i=0
     
-    printf "\e[?25l" # Cacher le curseur
+    printf "\e[?25l" >&2 # Cacher le curseur
     
     while kill -0 "$pid" 2>/dev/null; do
         local frame="${spin:$i:1}"
-        printf "\r  ${GREEN}%s${NC} %s" "$frame" "$message"
+        printf "\r  ${GREEN}%s${NC} %s" "$frame" "$message" >&2
         sleep 0.08
         i=$(( (i+1) % 10 ))
     done
@@ -49,8 +49,8 @@ run_with_spinner() {
     wait "$pid"
     local exit_code=$?
     
-    printf "\e[?25h" # Réafficher le curseur
-    printf "\r\e[K"  # Effacer la ligne courante
+    printf "\e[?25h" >&2 # Réafficher le curseur
+    printf "\r\e[K"  >&2 # Effacer la ligne courante
     
     return $exit_code
 }
@@ -82,7 +82,8 @@ echo -e "     ${BOLD}2)${NC} ${YELLOW}PC fixe${NC}      — accès direct au NAS
 echo -e "        ${DIM}Vos dossiers pointent directement vers le NAS monté.${NC}"
 echo -e "        ${DIM}Le NAS doit être joignable en permanence.${NC}"
 echo -e ""
-read -rp "  Votre choix [1/2, défaut=1] : " _MODE_CHOICE
+echo -en "  Votre choix [1/2, défaut=1] : "
+read -r _MODE_CHOICE
 case "${_MODE_CHOICE}" in
     2) INSTALL_MODE="fixe"     ;;
     *) INSTALL_MODE="portable" ;;
@@ -129,18 +130,14 @@ for entry in "${DIR_DEFS[@]}"; do
     nas_bytes=0
     nas_size_str=""
     if [ "$NAS_OK" = true ] && [ -d "$NAS/$nas_sub" ]; then
-        # Create a temp file to store the result because subshell variables aren't preserved in run_with_spinner
-        tmp_size_file=$(mktemp)
-        
-        run_with_spinner "Calcul du volume de '$fr_name' sur le NAS..." du -sb "$NAS/$nas_sub" > "$tmp_size_file" 2>/dev/null
-        
-        nas_bytes=$(awk '{print $1}' "$tmp_size_file" 2>/dev/null)
-        rm -f "$tmp_size_file"
+        nas_bytes_line=$(run_with_spinner "Calcul du volume de '$fr_name' sur le NAS..." du -sb "$NAS/$nas_sub")
+        nas_bytes=$(echo "$nas_bytes_line" | awk '{print $1}')
         nas_bytes=${nas_bytes:-0}
         nas_size_str=" (${GREEN}$(fmt_bytes "$nas_bytes")${NC} sur le NAS)"
     fi
 
-    read -rp "  [?] Synchroniser le dossier '$fr_name'$nas_size_str ? [O/n] : " answer
+    echo -en "  [?] Synchroniser le dossier '$fr_name'$nas_size_str ? [O/n] : "
+    read -r answer
     case "$answer" in
         n|N|no|NO|non|NON)
             echo -e "     ${DIM}→ dossier '$fr_name' ignoré${NC}"
@@ -157,9 +154,11 @@ for entry in "${DIR_DEFS[@]}"; do
             suggested_go=$(awk "BEGIN{printf \"%d\", $avail_bytes*0.8/1073741824}")
             [ "$suggested_go" -lt 1 ] && suggested_go=1
             warn "Ce dossier fait $(fmt_bytes $nas_bytes) ; espace libre sur votre PC : $(fmt_bytes $avail_bytes)"
-            read -rp "     $(echo -e "${YELLOW}»${NC}") Définir un quota en Go (0 = illimité, conseillé ≤ ${suggested_go} Go) : " quota_go
+            echo -en "     ${YELLOW}»${NC} Définir un quota en Go (0 = illimité, conseillé ≤ ${suggested_go} Go) : "
+            read -r quota_go
         else
-            read -rp "     $(echo -e "${CYAN}»${NC}") Définir un quota en Go (0 = tout télécharger) : " quota_go
+            echo -en "     ${CYAN}»${NC} Définir un quota en Go (0 = tout télécharger) : "
+            read -r quota_go
         fi
         [[ "$quota_go" =~ ^[0-9]+$ ]] || quota_go=0
     fi
@@ -203,7 +202,8 @@ if [ "$NAS_OK" = true ] && [ "$INSTALL_MODE" = "portable" ]; then
 fi
 echo -e "  ${BLUE}└────────────────────────────────────────────────────────┘${NC}"
 echo -e ""
-read -rp "  [?] Lancer l'installation maintenant ? [O/n] : " _CONFIRM
+echo -en "  [?] Lancer l'installation maintenant ? [O/n] : "
+read -r _CONFIRM
 case "${_CONFIRM:-o}" in
     n|N|no|NO|non|NON) echo "  Annulé."; exit 0 ;;
 esac
@@ -224,7 +224,7 @@ _dnf_install() {
     local pkg="$1" desc="$2"
     local tmp_err
     tmp_err=$(mktemp)
-    if run_with_spinner "Installation de $desc ($pkg)..." sudo dnf install -y "$pkg" > /dev/null 2> "$tmp_err"; then
+    if run_with_spinner "Installation de $desc ($pkg)..." bash -c "sudo dnf install -y $pkg >/dev/null 2>'$tmp_err'"; then
         ok "$desc installé"
     else
         warn "Échec installation $pkg — certaines fonctionnalités seront limitées (voir stderr)"
@@ -281,7 +281,7 @@ for entry in "${SELECTED_DIRS[@]}"; do
         rm "$link_path"
     elif [ -d "$link_path" ]; then
         if [ -n "$(ls -A "$link_path" 2>/dev/null)" ]; then
-            cp -a "$link_path/." "$target/" 2>/dev/null || true
+            run_with_spinner "Copie du contenu local de '$fr_name' vers le nouveau dossier..." cp -a "$link_path/." "$target/"
         fi
         rmdir "$link_path" 2>/dev/null || { warn "$link_path non vide — ignoré"; continue; }
     fi
@@ -422,7 +422,7 @@ else
         echo -e "  ${BOLD}${CYAN}»${NC} Synchronisation de : ${BOLD}$fr_name${NC} ($size_label)"
         rsync -ah --ignore-existing --info=progress2 $max_size_arg \
             "$src/" "$dst/" 2>/dev/null | \
-            awk -v fr="$fr_name" '
+            awk -v fr="$fr_name" -v RS='\r' '
             {
                 # Extraire le pourcentage
                 pct = 0
