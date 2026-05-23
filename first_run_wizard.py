@@ -323,13 +323,14 @@ class SetupWizard(Gtk.Assistant):
         ), False, False, 0)
 
         self._dir_rows = []
+        # (label, local_sub, nas_sub, enabled, max_age_days, max_size_mb)
         defaults = [
-            ("Bureau",          "Desktop",   "Desktop",   True,  0),
-            ("Téléchargements", "Downloads", "Downloads", True,  90),
-            ("Documents",       "Documents", "Documents", True,  0),
-            ("Images",          "Pictures",  "Pictures",  True,  0),
-            ("Musique",         "Music",     "Music",     True,  180),
-            ("Vidéos",          "video",     "video",     True,  90),
+            ("Bureau",          "Desktop",   "Desktop",   True,  0,   0),
+            ("Téléchargements", "Downloads", "Downloads", True,  90,  0),
+            ("Documents",       "Documents", "Documents", True,  0,   0),
+            ("Images",          "Pictures",  "Pictures",  True,  0,   0),
+            ("Musique",         "Music",     "Music",     True,  180, 0),
+            ("Vidéos",          "video",     "video",     True,  90,  0),
         ]
 
         grid = Gtk.Grid()
@@ -337,31 +338,38 @@ class SetupWizard(Gtk.Assistant):
         grid.set_column_spacing(10)
         grid.set_margin_top(8)
 
-        for col, (h, w) in enumerate(
-            [("", 30), ("Dossier", 160), ("NAS", 130), ("Âge max (jours, 0=tout)", 180)]
-        ):
+        for col, (h, w) in enumerate([
+            ("", 30), ("Dossier", 150), ("NAS", 120),
+            ("Âge max (j, 0=∞)", 130), ("Taille max (Mo, 0=∞)", 150),
+        ]):
             lbl = Gtk.Label()
             lbl.set_markup(f"<b>{h}</b>")
             lbl.set_xalign(0)
             lbl.set_size_request(w, -1)
             grid.attach(lbl, col, 0, 1, 1)
 
-        for row, (label, local_sub, nas_sub, enabled, max_age) in enumerate(defaults, 1):
+        for row, (label, local_sub, nas_sub, enabled, max_age, max_size) in enumerate(defaults, 1):
             chk = Gtk.CheckButton(label=label)
             chk.set_active(enabled)
 
-            e_local = Gtk.Entry(); e_local.set_text(local_sub); e_local.set_width_chars(14)
-            e_nas   = Gtk.Entry(); e_nas.set_text(nas_sub);     e_nas.set_width_chars(12)
+            e_local = Gtk.Entry(); e_local.set_text(local_sub); e_local.set_width_chars(13)
+            e_nas   = Gtk.Entry(); e_nas.set_text(nas_sub);     e_nas.set_width_chars(11)
 
-            spin = Gtk.SpinButton()
-            spin.set_adjustment(Gtk.Adjustment(value=max_age, lower=0, upper=3650, step_increment=30))
-            spin.set_numeric(True)
+            spin_age = Gtk.SpinButton()
+            spin_age.set_adjustment(Gtk.Adjustment(value=max_age, lower=0, upper=3650, step_increment=30))
+            spin_age.set_numeric(True)
 
-            grid.attach(chk,     0, row, 1, 1)
-            grid.attach(e_local, 1, row, 1, 1)
-            grid.attach(e_nas,   2, row, 1, 1)
-            grid.attach(spin,    3, row, 1, 1)
-            self._dir_rows.append((chk, e_local, e_nas, spin))
+            spin_size = Gtk.SpinButton()
+            spin_size.set_adjustment(Gtk.Adjustment(value=max_size, lower=0, upper=1_000_000, step_increment=1024))
+            spin_size.set_numeric(True)
+            spin_size.set_width_chars(8)
+
+            grid.attach(chk,       0, row, 1, 1)
+            grid.attach(e_local,   1, row, 1, 1)
+            grid.attach(e_nas,     2, row, 1, 1)
+            grid.attach(spin_age,  3, row, 1, 1)
+            grid.attach(spin_size, 4, row, 1, 1)
+            self._dir_rows.append((chk, e_local, e_nas, spin_age, spin_size))
 
         sw = Gtk.ScrolledWindow()
         sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -400,7 +408,7 @@ class SetupWizard(Gtk.Assistant):
         self._chk_backup  = Gtk.CheckButton(label="Sauvegarder les fichiers avant de les écraser")
         self._chk_backup.set_active(True)
         self._chk_battery = Gtk.CheckButton(label="Mettre en pause si sur batterie")
-        self._chk_notif   = Gtk.CheckButton(label="Afficher les notifications bureau")
+        self._chk_notif   = Gtk.CheckButton(label="Afficher les notifications bureau (GNOME, KDE, XFCE…)")
         self._chk_notif.set_active(True)
 
         for w in [self._chk_backup, self._chk_battery, self._chk_notif]:
@@ -494,13 +502,14 @@ class SetupWizard(Gtk.Assistant):
             prog(0.05, "Configuration…")
 
             dirs = []
-            for chk, e_local, e_nas, spin in self._dir_rows:
+            for chk, e_local, e_nas, spin_age, spin_size in self._dir_rows:
                 if chk.get_active():
                     dirs.append({
                         "local_sub":    e_local.get_text().strip(),
                         "nas_sub":      e_nas.get_text().strip(),
                         "enabled":      True,
-                        "max_age_days": int(spin.get_value()),
+                        "max_age_days": int(spin_age.get_value()),
+                        "max_size_mb":  int(spin_size.get_value()),
                     })
 
             cfg = DEFAULT_CONFIG.copy()
@@ -568,23 +577,26 @@ class SetupWizard(Gtk.Assistant):
 
             # ── 5. XDG user-dirs ─────────────────────────────────────────────
             log("→ Mise à jour de ~/.config/user-dirs.dirs…")
-            xdg_base = f"$HOME/NasShare" if mode == "fixe" else "$HOME/offline_cache"
-            xdg_map = {
-                "Desktop":   "XDG_DESKTOP_DIR",
-                "Downloads": "XDG_DOWNLOAD_DIR",
-                "Documents": "XDG_DOCUMENTS_DIR",
-                "Music":     "XDG_MUSIC_DIR",
-                "Pictures":  "XDG_PICTURES_DIR",
-                "video":     "XDG_VIDEOS_DIR",
-            }
-            lines = []
-            for local_sub, xdg_key in xdg_map.items():
-                if local_sub in local_subs:
-                    lines.append(f'{xdg_key}="{xdg_base}/{local_sub}"')
+            # Les XDG dirs pointent TOUJOURS vers les noms français (~/Bureau…).
+            # Ce sont ces noms français qui sont des liens symboliques vers le NAS
+            # ou le cache local. Ainsi user-dirs.dirs ne change jamais entre modes.
+            xdg_content = (
+                'XDG_DESKTOP_DIR="$HOME/Bureau"\n'
+                'XDG_DOWNLOAD_DIR="$HOME/Téléchargements"\n'
+                'XDG_TEMPLATES_DIR="$HOME/Modèles"\n'
+                'XDG_PUBLICSHARE_DIR="$HOME/Public"\n'
+                'XDG_DOCUMENTS_DIR="$HOME/Documents"\n'
+                'XDG_MUSIC_DIR="$HOME/Musique"\n'
+                'XDG_PICTURES_DIR="$HOME/Images"\n'
+                'XDG_VIDEOS_DIR="$HOME/Vidéos"\n'
+            )
             xdg_file = Path.home() / ".config" / "user-dirs.dirs"
-            xdg_file.write_text("\n".join(lines) + "\n")
+            xdg_file.parent.mkdir(parents=True, exist_ok=True)
+            xdg_file.write_text(xdg_content)
+            (Path.home() / "Modèles").mkdir(exist_ok=True)
+            (Path.home() / "Public").mkdir(exist_ok=True)
             subprocess.run(["xdg-user-dirs-update"], capture_output=True)
-            log("  ✓ XDG dirs mis à jour")
+            log("  ✓ XDG dirs mis à jour (noms français standards, tous les dossiers inclus)")
             prog(0.65)
 
             # ── 6. Service systemd (portable seulement) ───────────────────────
@@ -609,10 +621,10 @@ class SetupWizard(Gtk.Assistant):
                 log("  ℹ Mode PC fixe — service de synchronisation non activé")
             prog(0.80)
 
-            # ── 7. Entrée menu GNOME ──────────────────────────────────────────
-            log("→ Création de l'entrée menu GNOME…")
+            # ── 7. Entrée menu (XDG standard — GNOME, KDE, XFCE, Cinnamon…) ─────
+            log("→ Création de l'entrée menu applications…")
             _install_desktop_entry()
-            log("  ✓ Application visible dans GNOME Activities")
+            log("  ✓ Application visible dans le menu des applications")
             prog(0.90)
 
             # ── 8. Synchronisation initiale NAS → cache local ─────────────────
@@ -644,6 +656,21 @@ class SetupWizard(Gtk.Assistant):
 
                     if total_bytes > 0:
                         log(f"  Volume estimé : {_fmt_b(total_bytes)}")
+
+                    import shutil as _shutil
+                    avail = _shutil.disk_usage(
+                        str(Path.home() / "offline_cache")
+                    ).free
+                    MARGIN = 1_073_741_824  # 1 Go
+                    if total_bytes > 0 and avail < total_bytes + MARGIN:
+                        log(f"  ⚠ Espace disque insuffisant pour la synchronisation initiale !")
+                        log(f"    Nécessaire : {_fmt_b(total_bytes + MARGIN)}")
+                        log(f"    Disponible : {_fmt_b(avail)}")
+                        log(f"    La synchro initiale est ignorée.")
+                        log(f"    Libérez de l'espace disque puis relancez l'assistant.")
+                        prog(0.97)
+                        GLib.idle_add(self._install_done)
+                        return
 
                     bytes_offset = 0
                     for d in dirs:

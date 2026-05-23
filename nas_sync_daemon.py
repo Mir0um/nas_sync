@@ -23,12 +23,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from nas_sync_config import (
-    load_config, append_event, write_progress,
+    load_config, append_event, write_progress, free_bytes,
     CONFIG_FILE, LOG_FILE, STATE_FILE, PID_FILE, LOCK_FILE, BACKUP_DIR,
     LOCAL_BASE, NAS_MOUNT,
 )
 
 DIALOG_PY = Path(__file__).parent / "conflict_dialog.py"
+
+SPACE_MARGIN = 1_073_741_824  # 1 Go de marge de sécurité
+
+
+def _fmt_sz(n: int) -> str:
+    for unit, div in (("Go", 1_000_000_000), ("Mo", 1_000_000), ("Ko", 1_000)):
+        if n >= div:
+            return f"{n / div:.1f} {unit}"
+    return f"{n} o"
 
 # ── logging ───────────────────────────────────────────────────────────────────
 
@@ -451,6 +460,36 @@ def do_sync() -> int:
         elif n_mt is not None:
             to_local.append(key)
 
+    # ── filtrage par quota de taille (max_size_mb) ───────────────────────────
+    # Pour chaque dossier avec max_size_mb > 0, seuls les fichiers NAS les plus
+    # récents qui rentrent dans le budget sont autorisés à rejoindre le cache local.
+    _quota_sets: dict[str, set] = {}
+    for d in cfg["dirs"]:
+        max_mb = d.get("max_size_mb", 0)
+        if not d.get("enabled", True) or max_mb <= 0:
+            continue
+        sub    = d["local_sub"]
+        budget = max_mb * 1_048_576
+        # Tous les fichiers NAS de ce dossier, triés du plus récent au plus ancien
+        dir_files = sorted(
+            [(k, n_f[k], get_size(nas_path(k))) for k in n_f if k.startswith(sub + "/")],
+            key=lambda x: x[1], reverse=True,
+        )
+        cumul, in_q = 0, set()
+        for key, _mt, sz in dir_files:
+            if cumul + sz <= budget:
+                in_q.add(key)
+                cumul += sz
+        _quota_sets[sub] = in_q
+
+    if _quota_sets:
+        # Ne copier depuis le NAS que les fichiers dans le quota
+        to_local = [
+            k for k in to_local
+            if k.split("/")[0] not in _quota_sets
+            or k in _quota_sets.get(k.split("/")[0], set())
+        ]
+
     changes   = 0
     total_ops = len(to_nas) + len(to_local) + len(del_from_nas) + len(del_from_local) + len(conflicts)
     op        = 0
@@ -458,6 +497,21 @@ def do_sync() -> int:
     bytes_total = (sum(get_size(local_path(k)) for k in to_nas) +
                    sum(get_size(nas_path(k))   for k in to_local))
     bytes_done  = 0
+
+    # ── vérification espace disque avant copie NAS → local ───────────────────
+    needed_local = sum(get_size(nas_path(k)) for k in to_local)
+    available    = free_bytes(cfg["local_base"])
+    if needed_local > 0 and available < needed_local + SPACE_MARGIN:
+        short = needed_local + SPACE_MARGIN - available
+        msg   = (f"Espace disque insuffisant — manque {_fmt_sz(short)} "
+                 f"({_fmt_sz(needed_local)} à copier, {_fmt_sz(available)} libres, "
+                 f"marge de sécurité 1 Go)")
+        log.error(msg)
+        notify("NAS Sync — Disque plein", msg)
+        write_progress("erreur_espace", "", 0, 0)
+        append_event("erreur_espace", "disque", msg[:120])
+        save_state(new_state)
+        return 0
 
     # ── copier local → NAS
     for key in to_nas:
@@ -557,6 +611,44 @@ def do_sync() -> int:
             new_state[key] = state.get(key, 0)
             append_event("conflit ignoré", key)
 
+    # ── nettoyage cache local dépassant le quota ─────────────────────────────
+    # Pour chaque dossier avec max_size_mb, supprimer les fichiers locaux les plus
+    # anciens jusqu'à ce que le total soit ≤ budget.
+    for d in cfg["dirs"]:
+        max_mb = d.get("max_size_mb", 0)
+        if not d.get("enabled", True) or max_mb <= 0:
+            continue
+        sub       = d["local_sub"]
+        local_dir = Path(cfg["local_base"]) / sub
+        if not local_dir.exists():
+            continue
+        budget = max_mb * 1_048_576
+        local_files = [
+            (f, f.stat().st_mtime, f.stat().st_size)
+            for f in local_dir.rglob("*")
+            if f.is_file() and not is_excluded(f.name)
+        ]
+        total_size = sum(sz for _, _, sz in local_files)
+        if total_size <= budget:
+            continue
+        # Trier du plus ancien au plus récent — on supprime les anciens en premier
+        local_files.sort(key=lambda x: x[1])
+        for f, _mt, sz in local_files:
+            if total_size <= budget:
+                break
+            key = f"{sub}/{f.relative_to(local_dir)}"
+            try:
+                if do_bk:
+                    backup_file(f)
+                f.unlink()
+                total_size -= sz
+                new_state.pop(key, None)
+                append_event("quota_trim", key, f"hors quota {max_mb} Mo — {_fmt_sz(sz)}")
+                log.info(f"  quota: supprimé {key} ({_fmt_sz(sz)})")
+                changes += 1
+            except Exception as e:
+                log.error(f"quota trim {key}: {e}")
+
     save_state(new_state)
     write_progress("idle", "", changes, total_ops, bytes_done, bytes_total)
 
@@ -568,6 +660,46 @@ def do_sync() -> int:
             f"conflits={len(conflicts)} total={changes}"
         )
     return changes
+
+
+# ── montage automatique des NAS supplémentaires ───────────────────────────────
+
+def _try_mount_extra_nas():
+    for nas in cfg.get("extra_nas", []):
+        if not nas.get("enabled", True) or not nas.get("auto_mount", True):
+            continue
+        host     = nas.get("host", "")
+        mount_pt = Path(nas.get("mount_point", "")).expanduser()
+        if not host or not str(mount_pt):
+            continue
+        if mount_pt.is_mount():
+            continue
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2)
+            if s.connect_ex((host, 445)) != 0:
+                s.close()
+                continue
+            s.close()
+        except Exception:
+            continue
+        mount_pt.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(["mount", str(mount_pt)],
+                           capture_output=True, timeout=10)
+        if r.returncode == 0:
+            log.info(f"NAS supplémentaire monté : {mount_pt}")
+        else:
+            share = nas.get("share", "")
+            r2 = subprocess.run(
+                ["gio", "mount", f"smb://{host}/{share}"],
+                capture_output=True, timeout=10,
+                env=os.environ.copy(),
+            )
+            if r2.returncode == 0:
+                log.info(f"NAS supplémentaire monté via gio : {host}/{share}")
+            else:
+                log.debug(f"Montage NAS supplémentaire échoué : {host}/{share} — "
+                          f"ajoutez une entrée dans /etc/fstab avec l'option 'user'")
 
 
 # ── boucle principale ─────────────────────────────────────────────────────────
@@ -599,6 +731,7 @@ def main():
                     (Path(cfg["local_base"]) / d["local_sub"]).mkdir(parents=True, exist_ok=True)
 
             up = nas_available()
+            _try_mount_extra_nas()
 
             if is_paused():                    # fix 9
                 if up and not was_up:

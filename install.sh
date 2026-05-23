@@ -42,6 +42,7 @@ echo ""
 
 # ── Paramétrage des dossiers à synchroniser ──────────────────────────────────
 
+# Format : "Nom français|local_sub|nas_sub|XDG_KEY|max_age_days"
 DIR_DEFS=(
     "Bureau|Desktop|Desktop|XDG_DESKTOP_DIR|0"
     "Téléchargements|Downloads|Downloads|XDG_DOWNLOAD_DIR|90"
@@ -80,7 +81,7 @@ echo ""
 
 echo "Vérification des dépendances…"
 
-HAS_RSYNC=true
+HAS_RSYNC=false
 
 _dnf_install() {
     local pkg="$1" desc="$2"
@@ -92,6 +93,7 @@ _dnf_install() {
     fi
 }
 
+# PyGObject GTK3 (obligatoire)
 if ! python3 -c "import gi; gi.require_version('Gtk','3.0'); from gi.repository import Gtk" 2>/dev/null; then
     _dnf_install python3-gobject "PyGObject GTK3"
     python3 -c "import gi; gi.require_version('Gtk','3.0'); from gi.repository import Gtk" 2>/dev/null \
@@ -99,17 +101,21 @@ if ! python3 -c "import gi; gi.require_version('Gtk','3.0'); from gi.repository 
 fi
 ok "PyGObject GTK3"
 
-if ! python3 -c "import gi; gi.require_version('AppIndicator3','0.1'); from gi.repository import AppIndicator3" 2>/dev/null; then
-    _dnf_install libappindicator-gtk3 "AppIndicator3"
+# AppIndicator3 (optionnel — icône barre système enrichie sur GNOME/KDE/XFCE)
+if python3 -c "import gi; gi.require_version('AppIndicator3','0.1'); from gi.repository import AppIndicator3" 2>/dev/null; then
+    ok "AppIndicator3 (icône barre système native)"
+else
+    warn "AppIndicator3 non disponible — l'app utilisera le fallback standard (Gtk.StatusIcon)"
+    warn "  Pour l'activer sur Fedora/Nobara : sudo dnf install libappindicator-gtk3"
 fi
-python3 -c "import gi; gi.require_version('AppIndicator3','0.1'); from gi.repository import AppIndicator3" 2>/dev/null \
-    && ok "AppIndicator3" || warn "AppIndicator3 non disponible — icône barre système désactivée"
 
+# notify-send (notifications bureau — fonctionne sur GNOME, KDE, XFCE, Cinnamon…)
 if ! command -v notify-send &>/dev/null; then
     _dnf_install libnotify "notify-send"
 fi
 command -v notify-send &>/dev/null && ok "notify-send" || warn "notify-send absent"
 
+# rsync (synchro initiale)
 if ! command -v rsync &>/dev/null; then
     _dnf_install rsync "rsync"
 fi
@@ -117,37 +123,6 @@ if command -v rsync &>/dev/null; then
     ok "rsync"; HAS_RSYNC=true
 else
     warn "rsync absent — la synchro initiale sera ignorée"; HAS_RSYNC=false
-fi
-
-# ── Extension GNOME AppIndicator (nécessaire pour l'icône dans la barre) ──────
-
-echo ""
-echo "Vérification de l'extension GNOME AppIndicator…"
-
-APPIND_EXT="appindicatorsupport@rgcjonas.gmail.com"
-
-# Installer le paquet si absent
-if ! rpm -q gnome-shell-extension-appindicator &>/dev/null; then
-    _dnf_install gnome-shell-extension-appindicator "Extension GNOME AppIndicator"
-fi
-
-if rpm -q gnome-shell-extension-appindicator &>/dev/null; then
-    ok "Paquet gnome-shell-extension-appindicator présent"
-    # Activer l'extension dans la session courante si possible
-    if [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
-        if gnome-extensions enable "$APPIND_EXT" 2>/dev/null; then
-            ok "Extension $APPIND_EXT activée"
-        else
-            warn "Activation auto impossible — reconnectez-vous puis activez manuellement :"
-            warn "  gnome-extensions enable $APPIND_EXT"
-            warn "  ou via : https://extensions.gnome.org/extension/615/"
-        fi
-    else
-        warn "Pas de session graphique — l'extension sera activée à la prochaine connexion"
-        warn "Si l'icône n'apparaît pas, lancez : gnome-extensions enable $APPIND_EXT"
-    fi
-else
-    warn "Extension AppIndicator non disponible — l'app utilisera Gtk.StatusIcon en fallback"
 fi
 
 # ── NAS disponible ? ──────────────────────────────────────────────────────────
@@ -178,7 +153,7 @@ if [ "$NAS_OK" = true ] && [ "$HAS_RSYNC" = true ] && [ "$INSTALL_MODE" = "porta
     echo ""
     echo "Synchronisation initiale NAS → cache local …"
 
-    # Calculer la taille totale avant de commencer
+    # Calcul de la taille totale
     total_bytes=0
     for entry in "${SELECTED_DIRS[@]}"; do
         IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
@@ -195,22 +170,33 @@ if [ "$NAS_OK" = true ] && [ "$HAS_RSYNC" = true ] && [ "$INSTALL_MODE" = "porta
         total_human="${total_bytes} o"
     fi
     echo "  Volume total à copier : $total_human"
-    echo ""
 
-    for entry in "${SELECTED_DIRS[@]}"; do
-        IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
-        if [ -d "$NAS/$nas_sub" ]; then
-            nb=$(find "$NAS/$nas_sub" -type f 2>/dev/null | wc -l)
-            sz=$(du -sh "$NAS/$nas_sub" 2>/dev/null | awk '{print $1}')
-            echo "  $fr_name ($nb fichiers, $sz) :"
-            rsync -ah --ignore-existing --info=progress2 \
-                "$NAS/$nas_sub/" "$LOCAL/$local_sub/" 2>/dev/null || true
-            echo ""
-            ok "$fr_name synchronisé"
-        else
-            warn "$fr_name absent sur le NAS — ignoré"
-        fi
-    done
+    # Vérification espace disque (marge de sécurité : 1 Go)
+    available_kb=$(df -k "$LOCAL" 2>/dev/null | awk 'NR==2 {print $4}')
+    needed_kb=$(( total_bytes / 1024 ))
+    margin_kb=1048576
+    if [ -n "$available_kb" ] && [ $(( needed_kb + margin_kb )) -gt "$available_kb" ]; then
+        warn "Espace disque insuffisant pour la synchronisation initiale !"
+        warn "  Nécessaire : $(awk "BEGIN{printf \"%.1f Go\", ($needed_kb+$margin_kb)/1048576}")"
+        warn "  Disponible : $(awk "BEGIN{printf \"%.1f Go\", $available_kb/1048576}")"
+        warn "  Synchronisation initiale ignorée — libérez de l'espace puis relancez install.sh"
+    else
+        echo ""
+        for entry in "${SELECTED_DIRS[@]}"; do
+            IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
+            if [ -d "$NAS/$nas_sub" ]; then
+                nb=$(find "$NAS/$nas_sub" -type f 2>/dev/null | wc -l)
+                sz=$(du -sh "$NAS/$nas_sub" 2>/dev/null | awk '{print $1}')
+                echo "  $fr_name ($nb fichiers, $sz) :"
+                rsync -ah --ignore-existing --info=progress2 \
+                    "$NAS/$nas_sub/" "$LOCAL/$local_sub/" 2>/dev/null || true
+                echo ""
+                ok "$fr_name synchronisé"
+            else
+                warn "$fr_name absent sur le NAS — ignoré"
+            fi
+        done
+    fi
 fi
 
 # ── Liens symboliques ─────────────────────────────────────────────────────────
@@ -226,33 +212,41 @@ for entry in "${SELECTED_DIRS[@]}"; do
     IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
     link_path="$HOME/$fr_name"
     target="$LINK_BASE/$local_sub"
+    mkdir -p "$target"
     if [ -L "$link_path" ]; then
         rm "$link_path"
     elif [ -d "$link_path" ]; then
+        # Déplacer le contenu vers la cible avant de supprimer
+        if [ -n "$(ls -A "$link_path" 2>/dev/null)" ]; then
+            cp -a "$link_path/." "$target/" 2>/dev/null || true
+        fi
         rmdir "$link_path" 2>/dev/null || { warn "  $link_path non vide — ignoré"; continue; }
     fi
     ln -s "$target" "$link_path"
     ok "  $link_path → $target"
 done
 
-# ── XDG user-dirs ─────────────────────────────────────────────────────────────
+# ── XDG user-dirs (noms français standards, valables quel que soit le mode) ──
 
 echo ""
 echo "Mise à jour de ~/.config/user-dirs.dirs …"
 mkdir -p "$HOME/.config"
-if [ "$INSTALL_MODE" = "fixe" ]; then
-    XDG_BASE="\$HOME/NasShare"
-else
-    XDG_BASE="\$HOME/offline_cache"
-fi
-{
-    for entry in "${SELECTED_DIRS[@]}"; do
-        IFS='|' read -r fr_name local_sub nas_sub xdg_key max_age <<< "$entry"
-        echo "${xdg_key}=\"${XDG_BASE}/${local_sub}\""
-    done
-} > "$HOME/.config/user-dirs.dirs"
+# Les XDG dirs pointent TOUJOURS vers les noms français (~/Bureau, ~/Téléchargements…)
+# qui sont eux-mêmes des liens symboliques vers NAS ou cache local selon le mode.
+# Cela évite les conflits avec xdg-user-dirs-update et fonctionne sur tous les DE.
+cat > "$HOME/.config/user-dirs.dirs" << 'XDGEOF'
+XDG_DESKTOP_DIR="$HOME/Bureau"
+XDG_DOWNLOAD_DIR="$HOME/Téléchargements"
+XDG_TEMPLATES_DIR="$HOME/Modèles"
+XDG_PUBLICSHARE_DIR="$HOME/Public"
+XDG_DOCUMENTS_DIR="$HOME/Documents"
+XDG_MUSIC_DIR="$HOME/Musique"
+XDG_PICTURES_DIR="$HOME/Images"
+XDG_VIDEOS_DIR="$HOME/Vidéos"
+XDGEOF
+mkdir -p "$HOME/Modèles" "$HOME/Public"
 xdg-user-dirs-update 2>/dev/null || true
-ok "XDG user-dirs mis à jour"
+ok "XDG user-dirs mis à jour (noms français standards)"
 
 # ── Configuration initiale ────────────────────────────────────────────────────
 
@@ -266,7 +260,7 @@ PY
     ok "Configuration créée : $CONFIG"
 fi
 
-# Enregistrer le mode dans la configuration
+# Enregistrer le mode et les dossiers sélectionnés dans la configuration
 python3 - << PYEOF
 import json
 from pathlib import Path
@@ -292,7 +286,7 @@ if [ "$INSTALL_MODE" = "portable" ]; then
     mkdir -p "$HOME/.config/systemd/user"
     cat > "$HOME/.config/systemd/user/nas-sync.service" << EOF
 [Unit]
-Description=NAS Sync Daemon — Synchronisation bidirectionnelle offline_cache ↔ Cassis.local
+Description=NAS Sync Daemon — Synchronisation bidirectionnelle offline_cache ↔ NAS
 After=network.target graphical-session.target
 PartOf=graphical-session.target
 
@@ -318,10 +312,10 @@ else
     ok "Mode PC fixe — service de synchronisation non activé"
 fi
 
-# ── Autostart GNOME pour l'interface ─────────────────────────────────────────
+# ── Autostart (XDG standard — fonctionne sur GNOME, KDE, XFCE, Cinnamon…) ────
 
 echo ""
-echo "Installation de l'interface (autostart GNOME) …"
+echo "Installation du démarrage automatique …"
 mkdir -p "$HOME/.config/autostart"
 cat > "$HOME/.config/autostart/nas-sync-app.desktop" << EOF
 [Desktop Entry]
@@ -330,13 +324,17 @@ Comment=Interface de synchronisation NAS — barre système
 Exec=/usr/bin/python3 $SCRIPT_DIR/nas_sync_app.py
 Icon=network-server
 Type=Application
-Categories=Utility;
+Categories=Utility;Network;
 StartupNotify=false
-X-GNOME-Autostart-enabled=true
 EOF
-ok "Entrée autostart GNOME créée"
+# Entrée dans le menu des applications
+mkdir -p "$HOME/.local/share/applications"
+cp "$HOME/.config/autostart/nas-sync-app.desktop" \
+   "$HOME/.local/share/applications/nas-sync.desktop" 2>/dev/null || true
+update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+ok "Démarrage automatique configuré"
 
-# Lancer l'interface immédiatement (si on est dans une session graphique)
+# Lancer l'interface immédiatement (si session graphique active)
 if [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
     python3 "$SCRIPT_DIR/nas_sync_app.py" &
     ok "Interface lancée (icône dans la barre système)"
@@ -353,7 +351,7 @@ echo "  Mode            : $INSTALL_MODE"
 if [ "$INSTALL_MODE" = "portable" ]; then
 echo "  Cache local     : $LOCAL"
 echo "  Dossiers        : ${SELECTED_LABELS_JOINED}"
-echo "                    → pointent vers le cache local"
+echo "                    → liens symboliques vers le cache local"
 echo "                    → synchronisés automatiquement avec le NAS"
 echo ""
 echo "  Commandes utiles :"
@@ -366,15 +364,7 @@ echo "                    → pointent directement vers le NAS ($NAS)"
 echo "                    (le NAS doit être monté pour accéder aux fichiers)"
 fi
 echo ""
-echo "  Interface       : icône dans la barre système GNOME"
+echo "  Interface       : icône dans la barre système"
 echo "                    Démarre automatiquement à chaque login"
 echo "                    Pour changer de mode : Paramètres → onglet Mode"
-echo ""
-echo "  Action Nautilus (une seule fois) :"
-echo "    Clic droit sur anciens favoris → Retirer des favoris"
-if [ "$INSTALL_MODE" = "portable" ]; then
-echo "    Glisser les dossiers de ~/offline_cache/ dans la barre latérale"
-else
-echo "    Glisser les dossiers de ~/NasShare/ dans la barre latérale"
-fi
 echo ""

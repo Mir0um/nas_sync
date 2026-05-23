@@ -5,6 +5,7 @@ Icône visible quand la synchro est active, invisible sinon (fix PASSIVE/ACTIVE)
 """
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -33,6 +34,17 @@ except (ValueError, ImportError):
     pass
 
 DAEMON_PY = Path(__file__).parent / "nas_sync_daemon.py"
+
+
+def _info_dialog(parent, msg: str):
+    dlg = Gtk.MessageDialog(
+        parent=parent, modal=True,
+        message_type=Gtk.MessageType.INFO,
+        buttons=Gtk.ButtonsType.OK,
+        text=msg,
+    )
+    dlg.run()
+    dlg.destroy()
 ICON_ON   = "network-server"
 ICON_OFF  = "network-offline"
 REFRESH   = 4000   # ms
@@ -45,11 +57,28 @@ def _fmt_size(n: int) -> str:
     return f"{n} o"
 
 
+# Contenu standard de user-dirs.dirs — utilise les noms français.
+# Ne change JAMAIS entre les modes : seules les cibles des liens changent.
+_STANDARD_XDG_DIRS = (
+    'XDG_DESKTOP_DIR="$HOME/Bureau"\n'
+    'XDG_DOWNLOAD_DIR="$HOME/Téléchargements"\n'
+    'XDG_TEMPLATES_DIR="$HOME/Modèles"\n'
+    'XDG_PUBLICSHARE_DIR="$HOME/Public"\n'
+    'XDG_DOCUMENTS_DIR="$HOME/Documents"\n'
+    'XDG_MUSIC_DIR="$HOME/Musique"\n'
+    'XDG_PICTURES_DIR="$HOME/Images"\n'
+    'XDG_VIDEOS_DIR="$HOME/Vidéos"\n'
+)
+
 # ── Changement de mode (portable ↔ fixe) ─────────────────────────────────────
 
 def _apply_mode_switch(new_mode: str, cfg: dict):
-    """Met à jour les liens symboliques, XDG dirs et le service selon le mode."""
-    import subprocess
+    """Met à jour les liens symboliques et le service selon le mode.
+
+    user-dirs.dirs pointe toujours vers ~/Bureau, ~/Téléchargements, etc.
+    Seule la cible des liens symboliques change (NAS ou cache local).
+    Cela évite que xdg-user-dirs-update recrée les vrais dossiers.
+    """
     home       = Path.home()
     nas_mount  = Path(cfg.get("nas_mount",  str(home / "NasShare")))
     local_base = Path(cfg.get("local_base", str(home / "offline_cache")))
@@ -63,14 +92,6 @@ def _apply_mode_switch(new_mode: str, cfg: dict):
         "Music":     "Musique",
         "video":     "Vidéos",
     }
-    XDG_KEYS = {
-        "Desktop":   "XDG_DESKTOP_DIR",
-        "Downloads": "XDG_DOWNLOAD_DIR",
-        "Documents": "XDG_DOCUMENTS_DIR",
-        "Music":     "XDG_MUSIC_DIR",
-        "Pictures":  "XDG_PICTURES_DIR",
-        "video":     "XDG_VIDEOS_DIR",
-    }
     enabled = {d["local_sub"] for d in cfg.get("dirs", []) if d.get("enabled", True)}
 
     for sub, fr_name in FR_LINKS.items():
@@ -78,22 +99,34 @@ def _apply_mode_switch(new_mode: str, cfg: dict):
             continue
         target = base / sub
         link   = home / fr_name
+        target.mkdir(parents=True, exist_ok=True)
+
         if link.is_symlink():
             link.unlink()
         elif link.is_dir():
-            try: link.rmdir()
-            except OSError: pass
-        try: link.symlink_to(target)
-        except OSError: pass
+            # Dossier réel non-vide : déplacer le contenu vers la cible avant suppression
+            try:
+                for item in link.iterdir():
+                    dst = target / item.name
+                    if not dst.exists():
+                        shutil.move(str(item), str(dst))
+                link.rmdir()
+            except OSError:
+                pass
 
-    xdg_lines = [
-        f'{xdg}="{base}/{sub}"'
-        for sub, xdg in XDG_KEYS.items() if sub in enabled
-    ]
+        if not link.exists() and not link.is_symlink():
+            try:
+                link.symlink_to(target)
+            except OSError:
+                pass
+
+    # Corriger user-dirs.dirs : utiliser les noms français standards ($HOME/Bureau…)
     xdg_file = home / ".config" / "user-dirs.dirs"
     try:
-        xdg_file.write_text("\n".join(xdg_lines) + "\n")
-        subprocess.run(["xdg-user-dirs-update"], capture_output=True)
+        xdg_file.parent.mkdir(parents=True, exist_ok=True)
+        xdg_file.write_text(_STANDARD_XDG_DIRS)
+        for std_dir in ("Modèles", "Public"):
+            (home / std_dir).mkdir(exist_ok=True)
     except OSError:
         pass
 
@@ -182,6 +215,8 @@ class RecentWindow(Gtk.Window):
             "supprimé NAS":   "🗑 suppr NAS",
             "supprimé local": "🗑 suppr local",
             "supprimé partout":"🗑 suppr partout",
+            "quota_trim":     "✂ quota supprimé",
+            "erreur_espace":  "⚠ disque plein",
         }
         for ev in events:
             ts     = datetime.fromtimestamp(ev["ts"]).strftime("%d/%m %H:%M:%S")
@@ -234,6 +269,7 @@ class SettingsWindow(Gtk.Window):
         nb.append_page(self._tab_synchro(),    Gtk.Label(label="  Synchronisation  "))
         nb.append_page(self._tab_notifs(),     Gtk.Label(label="  Notifications  "))
         nb.append_page(self._tab_avance(),     Gtk.Label(label="  Filtres & Avancé  "))
+        nb.append_page(self._tab_extra_nas(),  Gtk.Label(label="  NAS supplémentaires  "))
 
         vbox.pack_start(Gtk.Separator(), False, False, 0)
         bbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -278,16 +314,26 @@ class SettingsWindow(Gtk.Window):
 
         info = Gtk.Label()
         info.set_markup(
-            "<small>Âge max = 0 → tous les fichiers. Sinon : ignorer les fichiers "
-            "non modifiés depuis N jours (utile pour Téléchargements / Vidéos).</small>"
+            "<small>"
+            "<b>Âge max (j)</b> = 0 → tous les fichiers. Sinon : ignorer les fichiers "
+            "non modifiés depuis N jours.\n"
+            "<b>Taille max (Mo)</b> = 0 → pas de limite. Sinon : ne garder dans le cache local "
+            "que les fichiers les plus récents qui rentrent dans ce volume. "
+            "Les plus anciens sont supprimés automatiquement (sauvegardés si l'option est active)."
+            "</small>"
         )
         info.set_xalign(0); info.set_line_wrap(True); info.set_margin_bottom(10)
         vbox.pack_start(info, False, False, 0)
 
-        self._dirs_store = Gtk.ListStore(bool, str, str, int)
+        self._dirs_store = Gtk.ListStore(bool, str, str, int, int)
         for d in self._cfg.get("dirs", []):
-            self._dirs_store.append([d.get("enabled", True), d.get("local_sub", ""),
-                                     d.get("nas_sub", ""), int(d.get("max_age_days", 0))])
+            self._dirs_store.append([
+                d.get("enabled", True),
+                d.get("local_sub", ""),
+                d.get("nas_sub", ""),
+                int(d.get("max_age_days", 0)),
+                int(d.get("max_size_mb", 0)),
+            ])
         tv = Gtk.TreeView(model=self._dirs_store); tv.set_rules_hint(True)
 
         r_toggle = Gtk.CellRendererToggle()
@@ -303,8 +349,20 @@ class SettingsWindow(Gtk.Window):
         r_spin = Gtk.CellRendererSpin()
         r_spin.set_property("adjustment", Gtk.Adjustment(value=0, lower=0, upper=3650, step_increment=30))
         r_spin.set_property("editable", True)
-        r_spin.connect("edited", lambda _r, p, t: self._dirs_store.__setitem__(p, list(self._dirs_store[p])[:3] + [int(t or 0)]))
-        tv.append_column(Gtk.TreeViewColumn("Âge max (jours)", r_spin, text=3))
+        r_spin.connect("edited", lambda _r, p, t: self._dirs_store.__setitem__(
+            p, list(self._dirs_store[p])[:3] + [int(t or 0)] + list(self._dirs_store[p])[4:]
+        ))
+        tv.append_column(Gtk.TreeViewColumn("Âge max (j)", r_spin, text=3))
+
+        r_size = Gtk.CellRendererSpin()
+        r_size.set_property("adjustment", Gtk.Adjustment(value=0, lower=0, upper=1_000_000, step_increment=1024))
+        r_size.set_property("editable", True)
+        r_size.connect("edited", lambda _r, p, t: self._dirs_store.__setitem__(
+            p, list(self._dirs_store[p])[:4] + [int(t or 0)]
+        ))
+        col_size = Gtk.TreeViewColumn("Taille max (Mo, 0=∞)", r_size, text=4)
+        col_size.set_min_width(130)
+        tv.append_column(col_size)
 
         self._dirs_tv = tv
         sw = Gtk.ScrolledWindow(); sw.set_min_content_height(200); sw.add(tv)
@@ -312,7 +370,7 @@ class SettingsWindow(Gtk.Window):
 
         bbox = Gtk.Box(spacing=6); bbox.set_margin_top(8)
         btn_add = Gtk.Button(label="+ Ajouter")
-        btn_add.connect("clicked", lambda _: self._dirs_store.append([True, "nouveau", "nouveau", 0]))
+        btn_add.connect("clicked", lambda _: self._dirs_store.append([True, "nouveau", "nouveau", 0, 0]))
         btn_del = Gtk.Button(label="− Supprimer")
         def del_row(_):
             _, it = tv.get_selection().get_selected()
@@ -364,7 +422,7 @@ class SettingsWindow(Gtk.Window):
 
     def _tab_notifs(self):
         grid = Gtk.Grid(); grid.set_border_width(16); grid.set_row_spacing(14); grid.set_column_spacing(14)
-        self._chk_notif = Gtk.CheckButton(label="Activer les notifications bureau GNOME")
+        self._chk_notif = Gtk.CheckButton(label="Activer les notifications bureau")
         self._chk_notif.set_active(self._cfg.get("notifications", True))
         grid.attach(self._chk_notif, 0, 0, 3, 1)
 
@@ -506,6 +564,142 @@ class SettingsWindow(Gtk.Window):
 
         return self._wrap(vbox)
 
+    # ── NAS supplémentaires ───────────────────────────────────────────────────
+
+    def _tab_extra_nas(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        vbox.set_border_width(12)
+
+        info = Gtk.Label()
+        info.set_markup(
+            "<small>Configurez des NAS supplémentaires montés automatiquement "
+            "dès qu'ils sont joignables.\n"
+            "Double-cliquez sur une cellule pour modifier. "
+            "Pour un montage persistant, ajoutez une entrée dans <tt>/etc/fstab</tt>.</small>"
+        )
+        info.set_xalign(0)
+        info.set_line_wrap(True)
+        vbox.pack_start(info, False, False, 0)
+
+        # Colonnes : enabled, name, host, share, mount_point, credentials_file
+        self._extra_nas_store = Gtk.ListStore(bool, str, str, str, str, str)
+        for n in self._cfg.get("extra_nas", []):
+            self._extra_nas_store.append([
+                n.get("enabled",          True),
+                n.get("name",             ""),
+                n.get("host",             ""),
+                n.get("share",            "home"),
+                n.get("mount_point",      str(Path.home() / ("Nas" + n.get("name", "Extra").replace(" ", "")))),
+                n.get("credentials_file", str(Path.home() / ".smbcredentials")),
+            ])
+
+        tv = Gtk.TreeView(model=self._extra_nas_store)
+        tv.set_rules_hint(True)
+
+        r_toggle = Gtk.CellRendererToggle()
+        r_toggle.connect("toggled", lambda r, p: self._extra_nas_store.__setitem__(
+            p, [not self._extra_nas_store[p][0]] + list(self._extra_nas_store[p])[1:]
+        ))
+        tv.append_column(Gtk.TreeViewColumn("✓", r_toggle, active=0))
+
+        for ci, (title, w, expand) in enumerate([
+            ("Nom",              100, False),
+            ("Hôte NAS",         130, False),
+            ("Partage",           80, False),
+            ("Point de montage", 180, True),
+            ("Credentials",      150, False),
+        ], 1):
+            r = Gtk.CellRendererText()
+            r.set_property("editable", True)
+            r.connect("edited", lambda _r, p, t, c=ci: self._extra_nas_store.__setitem__(
+                p, list(self._extra_nas_store[p])[:c] + [t] + list(self._extra_nas_store[p])[c+1:]
+            ))
+            col = Gtk.TreeViewColumn(title, r, text=ci)
+            col.set_min_width(w)
+            col.set_expand(expand)
+            tv.append_column(col)
+
+        self._extra_nas_tv = tv
+        sw = Gtk.ScrolledWindow()
+        sw.set_min_content_height(130)
+        sw.add(tv)
+        vbox.pack_start(sw, True, True, 0)
+
+        bbox = Gtk.Box(spacing=6)
+        bbox.set_margin_top(6)
+
+        def _add(_):
+            self._extra_nas_store.append([
+                True, "Nouveau NAS", "nas.local", "home",
+                str(Path.home() / "NasExtra"),
+                str(Path.home() / ".smbcredentials"),
+            ])
+        btn_add = Gtk.Button(label="+ Ajouter")
+        btn_add.connect("clicked", _add)
+
+        def _del(_):
+            _, it = tv.get_selection().get_selected()
+            if it:
+                self._extra_nas_store.remove(it)
+        btn_del = Gtk.Button(label="− Supprimer")
+        btn_del.connect("clicked", _del)
+
+        btn_mount = Gtk.Button(label="⏏ Monter maintenant")
+        btn_mount.connect("clicked", self._mount_selected_nas)
+
+        bbox.pack_start(btn_add,   False, False, 0)
+        bbox.pack_start(btn_del,   False, False, 0)
+        bbox.pack_end  (btn_mount, False, False, 0)
+        vbox.pack_start(bbox, False, False, 0)
+
+        sep = Gtk.Separator()
+        sep.set_margin_top(8)
+        vbox.pack_start(sep, False, False, 0)
+
+        fstab_lbl = Gtk.Label()
+        fstab_lbl.set_markup(
+            "<small><b>Montage persistant (une seule fois, en administrateur) :</b>\n"
+            "<tt>//HÔTE/PARTAGE  /POINT_MONTAGE  cifs  "
+            "credentials=/home/USER/.smbcredentials,"
+            "uid=UID,nofail,_netdev,vers=3.0  0 0</tt>\n"
+            "Puis : <tt>sudo systemctl daemon-reload &amp;&amp; sudo mount -a</tt></small>"
+        )
+        fstab_lbl.set_xalign(0)
+        fstab_lbl.set_line_wrap(True)
+        vbox.pack_start(fstab_lbl, False, False, 0)
+
+        return self._wrap(vbox)
+
+    def _mount_selected_nas(self, _):
+        _, it = self._extra_nas_tv.get_selection().get_selected()
+        if not it:
+            return
+        row       = list(self._extra_nas_store[it])
+        host      = row[2]
+        share     = row[3]
+        mount_pt  = row[4]
+        if not mount_pt:
+            return
+        Path(mount_pt).mkdir(parents=True, exist_ok=True)
+        # 1er essai : mount via fstab
+        r = subprocess.run(["mount", mount_pt], capture_output=True, timeout=15)
+        if r.returncode == 0:
+            _info_dialog(self, f"✓ Monté sur {mount_pt}")
+            return
+        # 2e essai : gio mount (sans point de montage fixe, mais sans sudo)
+        if host and share:
+            r2 = subprocess.run(
+                ["gio", "mount", f"smb://{host}/{share}"],
+                capture_output=True, timeout=15,
+                env=os.environ.copy(),
+            )
+            if r2.returncode == 0:
+                _info_dialog(self, f"✓ Monté via SMB : smb://{host}/{share}")
+                return
+        err = r.stderr.decode(errors="replace").strip() or \
+              "Ajoutez une entrée dans /etc/fstab avec l'option 'user'."
+        _info_dialog(self, f"Impossible de monter {mount_pt}\n\n{err}")
+
     # ── sauvegarde ────────────────────────────────────────────────────────────
 
     def _wrap(self, w):
@@ -519,7 +713,13 @@ class SettingsWindow(Gtk.Window):
             cfg[key] = int(val) if key == "nas_port" and val.isdigit() else val
 
         cfg["dirs"] = [
-            {"enabled": row[0], "local_sub": row[1], "nas_sub": row[2], "max_age_days": row[3]}
+            {
+                "enabled":      row[0],
+                "local_sub":    row[1],
+                "nas_sub":      row[2],
+                "max_age_days": row[3],
+                "max_size_mb":  row[4],
+            }
             for row in self._dirs_store
         ]
 
@@ -542,6 +742,19 @@ class SettingsWindow(Gtk.Window):
         cfg["deletion_sync"]          = self._chk_del.get_active()
         cfg["pause_on_battery"]       = self._chk_battery.get_active()
         cfg["pause_on_metered"]       = self._chk_metered.get_active()
+
+        cfg["extra_nas"] = [
+            {
+                "enabled":          row[0],
+                "name":             row[1],
+                "host":             row[2],
+                "share":            row[3],
+                "mount_point":      row[4],
+                "credentials_file": row[5],
+                "auto_mount":       True,
+            }
+            for row in self._extra_nas_store
+        ]
 
         old_mode   = self._cfg.get("mode", "portable")
         cfg["mode"] = "fixe" if self._radio_fixe.get_active() else "portable"

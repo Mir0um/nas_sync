@@ -2,6 +2,7 @@
 """Module de configuration partagé entre le démon et l'interface."""
 
 import json
+import shutil
 import time
 from pathlib import Path
 
@@ -48,14 +49,25 @@ DEFAULT_CONFIG = {
     "pause_on_battery": False,
     "pause_on_metered": False,
     "dirs": [
-        {"local_sub": "Desktop",   "nas_sub": "Desktop",   "enabled": True,  "max_age_days": 0},
-        {"local_sub": "Downloads", "nas_sub": "Downloads", "enabled": True,  "max_age_days": 90},
-        {"local_sub": "Documents", "nas_sub": "Documents", "enabled": True,  "max_age_days": 0},
-        {"local_sub": "Music",     "nas_sub": "Music",     "enabled": True,  "max_age_days": 180},
-        {"local_sub": "Pictures",  "nas_sub": "Pictures",  "enabled": True,  "max_age_days": 0},
-        {"local_sub": "video",     "nas_sub": "video",     "enabled": True,  "max_age_days": 90},
+        {"local_sub": "Desktop",   "nas_sub": "Desktop",   "enabled": True,  "max_age_days": 0,   "max_size_mb": 0},
+        {"local_sub": "Downloads", "nas_sub": "Downloads", "enabled": True,  "max_age_days": 90,  "max_size_mb": 0},
+        {"local_sub": "Documents", "nas_sub": "Documents", "enabled": True,  "max_age_days": 0,   "max_size_mb": 0},
+        {"local_sub": "Music",     "nas_sub": "Music",     "enabled": True,  "max_age_days": 180, "max_size_mb": 0},
+        {"local_sub": "Pictures",  "nas_sub": "Pictures",  "enabled": True,  "max_age_days": 0,   "max_size_mb": 0},
+        {"local_sub": "video",     "nas_sub": "video",     "enabled": True,  "max_age_days": 90,  "max_size_mb": 0},
     ],
+    # NAS supplémentaires à monter automatiquement
+    # Chaque entrée : {name, host, share, mount_point, credentials_file, enabled, auto_mount}
+    "extra_nas": [],
 }
+
+
+def free_bytes(path) -> int:
+    """Espace disque disponible en octets sur la partition contenant path."""
+    try:
+        return shutil.disk_usage(str(path)).free
+    except Exception:
+        return 0
 
 
 def load_config() -> dict:
