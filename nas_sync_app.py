@@ -130,14 +130,28 @@ def _apply_mode_switch(new_mode: str, cfg: dict):
     except OSError:
         pass
 
+    IS_FLATPAK = Path("/.flatpak-info").exists()
     svc = "nas-sync.service"
     if new_mode == "fixe":
-        subprocess.run(["systemctl", "--user", "stop",    svc], capture_output=True)
-        subprocess.run(["systemctl", "--user", "disable", svc], capture_output=True)
+        if not IS_FLATPAK:
+            subprocess.run(["systemctl", "--user", "stop",    svc], capture_output=True)
+            subprocess.run(["systemctl", "--user", "disable", svc], capture_output=True)
+        pid = get_daemon_pid()
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
     else:
         local_base.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["systemctl", "--user", "enable", svc], capture_output=True)
-        subprocess.run(["systemctl", "--user", "start",  svc], capture_output=True)
+        if not IS_FLATPAK:
+            subprocess.run(["systemctl", "--user", "enable", svc], capture_output=True)
+            subprocess.run(["systemctl", "--user", "start",  svc], capture_output=True)
+        else:
+            subprocess.Popen(
+                [sys.executable, str(DAEMON_PY)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

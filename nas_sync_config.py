@@ -2,21 +2,71 @@
 """Module de configuration partagé entre le démon et l'interface."""
 
 import json
+import os
 import shutil
 import time
 from pathlib import Path
 
-HOME          = Path.home()
-CONFIG_FILE   = HOME / ".nas_sync_config.json"
-EVENTS_FILE   = HOME / ".nas_sync_events.jsonl"
-PID_FILE      = HOME / ".nas_sync.pid"
-LOG_FILE      = HOME / ".nas_sync.log"
-STATE_FILE    = HOME / ".nas_sync_state.json"
-LOCK_FILE     = HOME / ".nas_sync.lock"          # verrou instance unique (fix 2)
-PROGRESS_FILE = HOME / ".nas_sync_progress.json" # progression en cours (fix 6)
-BACKUP_DIR    = HOME / ".nas_sync_backups"        # sauvegardes avant écrasement (fix 3)
+HOME = Path.home()
+UID = os.getuid()
+
+# Définition des répertoires conformes aux spécifications XDG
+XDG_CONFIG  = Path(os.getenv("XDG_CONFIG_HOME", HOME / ".config")) / "nas_sync"
+XDG_CACHE   = Path(os.getenv("XDG_CACHE_HOME", HOME / ".cache")) / "nas_sync"
+XDG_DATA    = Path(os.getenv("XDG_DATA_HOME", HOME / ".local" / "share")) / "nas_sync"
+XDG_RUNTIME = Path(os.getenv("XDG_RUNTIME_DIR", f"/run/user/{UID}")) / "nas_sync"
+
+# Cas d'un système sans XDG_RUNTIME_DIR (ex: session non graphique minimale ou conteneur)
+if not XDG_RUNTIME.parent.exists():
+    XDG_RUNTIME = XDG_CACHE / "runtime"
+
+# Fichiers conformes aux spécifications XDG
+CONFIG_FILE   = XDG_CONFIG / "config.json"
+EVENTS_FILE   = XDG_CACHE / "events.jsonl"
+STATE_FILE    = XDG_CACHE / "state.json"
+LOG_FILE      = XDG_CACHE / "daemon.log"
+PID_FILE      = XDG_RUNTIME / "daemon.pid"
+LOCK_FILE     = XDG_RUNTIME / "daemon.lock"
+PROGRESS_FILE = XDG_RUNTIME / "progress.json"
+BACKUP_DIR    = XDG_DATA / "backups"
+
 LOCAL_BASE    = HOME / "offline_cache"
 NAS_MOUNT     = HOME / "NasShare"
+
+def migrate_old_files():
+    """Migre les anciens fichiers de configuration et d'état vers XDG."""
+    # S'assurer que les dossiers XDG de destination existent
+    XDG_CONFIG.mkdir(parents=True, exist_ok=True)
+    XDG_CACHE.mkdir(parents=True, exist_ok=True)
+    XDG_DATA.mkdir(parents=True, exist_ok=True)
+    XDG_RUNTIME.mkdir(parents=True, exist_ok=True)
+
+    old_to_new = [
+        (HOME / ".nas_sync_config.json", CONFIG_FILE),
+        (HOME / ".nas_sync_events.jsonl", EVENTS_FILE),
+        (HOME / ".nas_sync_state.json", STATE_FILE),
+        (HOME / ".nas_sync.log", LOG_FILE),
+        (HOME / ".nas_sync.pid", PID_FILE),
+        (HOME / ".nas_sync.lock", LOCK_FILE),
+        (HOME / ".nas_sync_progress.json", PROGRESS_FILE),
+    ]
+
+    for old, new in old_to_new:
+        if old.exists() and not new.exists():
+            try:
+                shutil.move(str(old), str(new))
+            except Exception:
+                pass
+
+    old_backup = HOME / ".nas_sync_backups"
+    if old_backup.exists() and old_backup.is_dir() and not BACKUP_DIR.exists():
+        try:
+            shutil.move(str(old_backup), str(BACKUP_DIR))
+        except Exception:
+            pass
+
+# Lancement de la migration de manière transparente
+migrate_old_files()
 
 MAX_EVENTS   = 1000
 _TRIM_EVERY  = 50    # fix 13 : élagage tous les N appels seulement

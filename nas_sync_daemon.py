@@ -121,13 +121,22 @@ def is_on_battery() -> bool:
 
 def is_metered() -> bool:
     try:
-        r = subprocess.run(
-            ["nmcli", "-t", "-f", "GENERAL.METERED", "device", "show"],
-            capture_output=True, text=True, timeout=3,
+        from gi.repository import Gio
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        proxy = Gio.DBusProxy.new_sync(
+            bus, Gio.DBusProxyFlags.NONE, None,
+            "org.freedesktop.NetworkManager",
+            "/org/freedesktop/NetworkManager",
+            "org.freedesktop.NetworkManager",
+            None
         )
-        return "yes" in r.stdout.lower()
+        metered = proxy.get_cached_property("Metered")
+        if metered:
+            val = metered.unpack()
+            return val in (1, 3)
     except Exception:
-        return False
+        pass
+    return False
 
 
 def is_paused() -> bool:
@@ -181,12 +190,14 @@ def notify(summary: str, body: str = ""):
     if not cfg.get("notifications", True):
         return
     try:
-        subprocess.Popen(
-            ["notify-send", "--icon=network-server", summary, body],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        pass
+        import gi
+        gi.require_version("Notify", "0.7")
+        from gi.repository import Notify
+        Notify.init("NAS Sync")
+        n = Notify.Notification.new(summary, body, "network-server")
+        n.show()
+    except Exception as e:
+        log.warning(f"Notification native échouée : {e}")
 
 
 def local_path(key: str) -> Path:
@@ -683,12 +694,16 @@ def _try_mount_extra_nas():
             s.close()
         except Exception:
             continue
-        mount_pt.mkdir(parents=True, exist_ok=True)
-        r = subprocess.run(["mount", str(mount_pt)],
-                           capture_output=True, timeout=10)
-        if r.returncode == 0:
-            log.info(f"NAS supplémentaire monté : {mount_pt}")
-        else:
+        try:
+            r = subprocess.run(["mount", str(mount_pt)],
+                               capture_output=True, timeout=10)
+            if r.returncode == 0:
+                log.info(f"NAS supplémentaire monté : {mount_pt}")
+                continue
+        except Exception as e:
+            log.warning(f"La commande 'mount' a échoué ou est absente : {e}")
+
+        try:
             share = nas.get("share", "")
             r2 = subprocess.run(
                 ["gio", "mount", f"smb://{host}/{share}"],
@@ -700,6 +715,8 @@ def _try_mount_extra_nas():
             else:
                 log.debug(f"Montage NAS supplémentaire échoué : {host}/{share} — "
                           f"ajoutez une entrée dans /etc/fstab avec l'option 'user'")
+        except Exception as e:
+            log.warning(f"La commande 'gio mount' a échoué ou est absente : {e}")
 
 
 # ── boucle principale ─────────────────────────────────────────────────────────

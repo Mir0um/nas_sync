@@ -600,23 +600,27 @@ class SetupWizard(Gtk.Assistant):
             prog(0.65)
 
             # ── 6. Service systemd (portable seulement) ───────────────────────
+            IS_FLATPAK = Path("/.flatpak-info").exists()
             if mode == "portable":
-                log("→ Installation du service systemd…")
-                svc_dir = Path.home() / ".config" / "systemd" / "user"
-                svc_dir.mkdir(parents=True, exist_ok=True)
-                svc = svc_dir / SERVICE
-                svc.write_text(
-                    f"[Unit]\nDescription=NAS Sync Daemon\n"
-                    f"After=network.target graphical-session.target\n"
-                    f"PartOf=graphical-session.target\n\n"
-                    f"[Service]\nType=simple\n"
-                    f"ExecStart=/usr/bin/python3 {DAEMON_PY}\n"
-                    f"Restart=on-failure\nRestartSec=15\n\n"
-                    f"[Install]\nWantedBy=graphical-session.target\n"
-                )
-                subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
-                subprocess.run(["systemctl", "--user", "enable", SERVICE], capture_output=True)
-                log("  ✓ Service installé et activé")
+                if not IS_FLATPAK:
+                    log("→ Installation du service systemd…")
+                    svc_dir = Path.home() / ".config" / "systemd" / "user"
+                    svc_dir.mkdir(parents=True, exist_ok=True)
+                    svc = svc_dir / SERVICE
+                    svc.write_text(
+                        f"[Unit]\nDescription=NAS Sync Daemon\n"
+                        f"After=network.target graphical-session.target\n"
+                        f"PartOf=graphical-session.target\n\n"
+                        f"[Service]\nType=simple\n"
+                        f"ExecStart=/usr/bin/python3 {DAEMON_PY}\n"
+                        f"Restart=on-failure\nRestartSec=15\n\n"
+                        f"[Install]\nWantedBy=graphical-session.target\n"
+                    )
+                    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+                    subprocess.run(["systemctl", "--user", "enable", SERVICE], capture_output=True)
+                    log("  ✓ Service installé et activé")
+                else:
+                    log("  ℹ Sous Flatpak — service systemd contourné (lancement direct)")
             else:
                 log("  ℹ Mode PC fixe — service de synchronisation non activé")
             prog(0.80)
@@ -716,15 +720,23 @@ class SetupWizard(Gtk.Assistant):
 
             # ── 9. Démarrer le démon (portable seulement) ─────────────────────
             if mode == "portable":
-                log("→ Démarrage du service…")
-                subprocess.run(["systemctl", "--user", "start", SERVICE], capture_output=True)
-                import time; time.sleep(1)
-                r = subprocess.run(["systemctl", "--user", "is-active", SERVICE],
-                                   capture_output=True, text=True)
-                if r.stdout.strip() == "active":
-                    log("  ✓ Service démarré")
+                if not IS_FLATPAK:
+                    log("→ Démarrage du service…")
+                    subprocess.run(["systemctl", "--user", "start", SERVICE], capture_output=True)
+                    import time; time.sleep(1)
+                    r = subprocess.run(["systemctl", "--user", "is-active", SERVICE],
+                                       capture_output=True, text=True)
+                    if r.stdout.strip() == "active":
+                        log("  ✓ Service démarré")
+                    else:
+                        log("  ⚠ Service démarré (vérifiez : systemctl --user status nas-sync)")
                 else:
-                    log("  ⚠ Service démarré (vérifiez : systemctl --user status nas-sync)")
+                    log("→ Démarrage du démon en arrière-plan…")
+                    subprocess.Popen(
+                        [sys.executable, str(DAEMON_PY)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    log("  ✓ Démon démarré")
             else:
                 log("  ℹ Mode PC fixe — pas de démon, accès direct au NAS")
             prog(1.0)
@@ -764,15 +776,22 @@ class SetupWizard(Gtk.Assistant):
 # ── entrée menu GNOME ─────────────────────────────────────────────────────────
 
 def _install_desktop_entry():
+    IS_FLATPAK = Path("/.flatpak-info").exists()
     app_dir = Path.home() / ".local" / "share" / "applications"
     app_dir.mkdir(parents=True, exist_ok=True)
-    desktop = app_dir / "nas-sync.desktop"
+    desktop = app_dir / "nas-sync.desktop" if not IS_FLATPAK else app_dir / "org.cassis.NasSync.desktop"
+    
+    if IS_FLATPAK:
+        exec_cmd = "flatpak run org.cassis.NasSync"
+    else:
+        exec_cmd = f"/usr/bin/python3 {SCRIPT_DIR}/nas_sync_app.py"
+
     desktop.write_text(
         f"[Desktop Entry]\n"
         f"Name=NAS Sync\n"
         f"GenericName=Synchronisation NAS\n"
         f"Comment=Synchronisation automatique avec le NAS d'entreprise\n"
-        f"Exec=/usr/bin/python3 {SCRIPT_DIR}/nas_sync_app.py\n"
+        f"Exec={exec_cmd}\n"
         f"Icon=network-server\n"
         f"Type=Application\n"
         f"Categories=Utility;Network;FileManager;\n"
@@ -780,6 +799,23 @@ def _install_desktop_entry():
         f"StartupNotify=false\n"
         f"Terminal=false\n"
     )
+    
+    if IS_FLATPAK:
+        # Configuration de l'autostart pour démarrer le Flatpak au login
+        autostart_dir = Path.home() / ".config" / "autostart"
+        autostart_dir.mkdir(parents=True, exist_ok=True)
+        autostart_file = autostart_dir / "org.cassis.NasSync.desktop"
+        autostart_file.write_text(
+            f"[Desktop Entry]\n"
+            f"Name=NAS Sync\n"
+            f"Comment=Interface de synchronisation NAS — barre système\n"
+            f"Exec=flatpak run org.cassis.NasSync --background\n"
+            f"Icon=network-server\n"
+            f"Type=Application\n"
+            f"Categories=Utility;\n"
+            f"StartupNotify=false\n"
+            f"X-GNOME-Autostart-enabled=true\n"
+        )
     subprocess.run(["update-desktop-database", str(app_dir)], capture_output=True)
 
 
