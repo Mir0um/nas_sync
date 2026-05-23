@@ -7,7 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL="$HOME/offline_cache"
 NAS="$HOME/NasShare"
-CONFIG="$HOME/.nas_sync_config.json"
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/nas_sync/config.json"
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 ok()   { echo -e "${GREEN}✓${NC} $*"; }
@@ -356,7 +356,7 @@ echo "                    → synchronisés automatiquement avec le NAS"
 echo ""
 echo "  Commandes utiles :"
 echo "    Statut démon       : systemctl --user status nas-sync"
-echo "    Logs               : tail -f ~/.nas_sync.log"
+echo "    Logs               : tail -f \${XDG_CACHE_HOME:-\$HOME/.cache}/nas_sync/daemon.log"
 echo "    Activer/désactiver : bash $SCRIPT_DIR/toggle.sh"
 else
 echo "  Dossiers        : ${SELECTED_LABELS_JOINED}"

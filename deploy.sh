@@ -92,7 +92,7 @@ USER_HOME=$(getent passwd "$DEPLOY_USER" | cut -d: -f6)
 
 NAS_MOUNT="$USER_HOME/NasShare"
 LOCAL_BASE="$USER_HOME/offline_cache"
-CONFIG_FILE="$USER_HOME/.nas_sync_config.json"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$USER_HOME/.config}/nas_sync/config.json"
 CREDS_FILE="$USER_HOME/.smbcredentials"
 
 echo "  Utilisateur cible : $DEPLOY_USER ($USER_HOME)"
@@ -207,7 +207,7 @@ if [[ "$SETUP_MOUNT" == true ]]; then
     chown "$DEPLOY_USER:$DEPLOY_USER" "$NAS_MOUNT"
 
     # Vérifier si déjà dans fstab
-    FSTAB_ENTRY="//$NAS_HOST/$NAS_SHARE $NAS_MOUNT cifs credentials=$CREDS_FILE,uid=$(id -u "$DEPLOY_USER"),gid=$(id -g "$DEPLOY_USER"),nofail,_netdev,vers=3.0,iocharset=utf8 0 0"
+    FSTAB_ENTRY="//$NAS_HOST/$NAS_SHARE $NAS_MOUNT cifs credentials=$CREDS_FILE,uid=$(id -u "$DEPLOY_USER"),gid=$(id -g "$DEPLOY_USER"),nofail,_netdev,x-systemd.automount,x-systemd.mount-timeout=5,x-systemd.idle-timeout=60,user,vers=3.0,iocharset=utf8 0 0"
 
     if grep -qF "//$NAS_HOST/$NAS_SHARE" /etc/fstab 2>/dev/null; then
         warn "Entrée fstab pour //$NAS_HOST/$NAS_SHARE déjà présente — ignorée"
@@ -232,6 +232,7 @@ fi
 echo "── Configuration ───────────────────────────────────────"
 
 # Écrire la config uniquement si elle n'existe pas déjà
+mkdir -p "$(dirname "$CONFIG_FILE")"
 if [[ ! -f "$CONFIG_FILE" ]]; then
     python3 - << PYEOF
 import json, sys
@@ -270,7 +271,7 @@ cfg = {
 }
 Path("$CONFIG_FILE").write_text(json.dumps(cfg, indent=2))
 PYEOF
-    chown "$DEPLOY_USER:$DEPLOY_USER" "$CONFIG_FILE"
+    chown -R "$DEPLOY_USER:$DEPLOY_USER" "$(dirname "$CONFIG_FILE")"
     ok "Configuration créée : $CONFIG_FILE"
 else
     ok "Configuration existante conservée : $CONFIG_FILE"
@@ -438,5 +439,5 @@ echo "    • Les dossiers ~/Bureau, ~/Documents… pointent vers le cache local
 echo ""
 echo "  Commandes utiles (en tant que $DEPLOY_USER) :"
 echo "    systemctl --user status nas-sync"
-echo "    tail -f $USER_HOME/.nas_sync.log"
+echo "    tail -f ${XDG_CACHE_HOME:-$USER_HOME/.cache}/nas_sync/daemon.log"
 echo ""

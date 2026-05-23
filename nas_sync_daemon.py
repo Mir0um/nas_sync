@@ -100,9 +100,41 @@ def nas_reachable() -> bool:
 
 def nas_mounted() -> bool:
     try:
-        return Path(cfg["nas_mount"]).is_mount()
+        # Lance mountpoint avec un timeout de 2 secondes pour éviter les blocages de stat()
+        r = subprocess.run(
+            ["timeout", "2", "mountpoint", "-q", cfg["nas_mount"]],
+            capture_output=True,
+            timeout=3
+        )
+        return r.returncode == 0
     except Exception:
         return False
+
+
+def _try_mount_main_nas() -> bool:
+    """Tente de monter le NAS principal si le réseau est disponible."""
+    mount_pt = Path(cfg["nas_mount"]).expanduser()
+    if nas_mounted():
+        return True
+
+    # Vérification réseau rapide avant de lancer mount
+    if not nas_reachable():
+        return False
+
+    log.info(f"NAS principal accessible mais non monté. Tentative de montage sur {mount_pt}...")
+    try:
+        mount_pt.mkdir(parents=True, exist_ok=True)
+        # Exécute mount (réussira si l'option 'user' est présente dans /etc/fstab)
+        r = subprocess.run(["mount", str(mount_pt)], capture_output=True, timeout=10)
+        if r.returncode == 0:
+            log.info("NAS principal monté avec succès via mount")
+            return True
+        else:
+            stderr = r.stderr.decode().strip()
+            log.warning(f"Échec de la commande mount (code {r.returncode}) : {stderr}")
+    except Exception as e:
+        log.warning(f"Erreur lors du montage automatique du NAS : {e}")
+    return False
 
 
 # ── fix 9 : pause intelligente ────────────────────────────────────────────────
@@ -148,7 +180,12 @@ def is_paused() -> bool:
 
 
 def nas_available() -> bool:
-    return nas_reachable() and nas_mounted()
+    if not nas_reachable():
+        return False
+    if not nas_mounted():
+        # Essayer de monter à la volée si joignable
+        return _try_mount_main_nas()
+    return True
 
 
 # ── fix 7 : décalage horloge NAS ─────────────────────────────────────────────
@@ -431,23 +468,8 @@ def do_sync() -> int:
         n_mt = n_f.get(key)
         s_mt = state.get(key)
 
-        # fix 4 : détection de suppressions
-        if key in state_keys and key not in scan_keys:
-            lp = local_path(key)
-            np = nas_path(key)
-            l_exists = lp.exists()
-            n_exists = np.exists()
-            if not l_exists and not n_exists:
-                append_event("supprimé partout", key)
-            elif not l_exists and n_exists and cfg.get("deletion_sync", False):
-                del_from_nas.append(key)
-            elif l_exists and not n_exists and cfg.get("deletion_sync", False):
-                del_from_local.append(key)
-            else:
-                new_state[key] = state[key]  # age-filtré, conserver
-            continue
-
         if l_mt is not None and n_mt is not None:
+            # Les deux côtés sont visibles dans le scan
             if s_mt is None:
                 if l_mt > n_mt + eps:
                     to_nas.append(key)
@@ -466,10 +488,49 @@ def do_sync() -> int:
                     to_local.append(key)
                 else:
                     new_state[key] = s_mt
+
         elif l_mt is not None:
-            to_nas.append(key)
+            # Local visible, NAS absent du scan
+            if s_mt is not None and not nas_path(key).exists():
+                # NAS vraiment supprimé (pas juste filtré par âge ou motif)
+                if l_mt > s_mt + eps:
+                    conflicts.append(key)           # local modifié + NAS supprimé
+                elif cfg.get("deletion_sync", False):
+                    del_from_local.append(key)
+                else:
+                    new_state[key] = s_mt           # deletion_sync off → conserver
+            else:
+                # Nouveau fichier local, ou NAS présent mais filtré
+                to_nas.append(key)
+
         elif n_mt is not None:
-            to_local.append(key)
+            # NAS visible, local absent du scan
+            if s_mt is not None and not local_path(key).exists():
+                # Local vraiment supprimé (pas juste filtré par âge ou motif)
+                if n_mt > s_mt + eps:
+                    conflicts.append(key)           # NAS modifié + local supprimé
+                elif cfg.get("deletion_sync", False):
+                    del_from_nas.append(key)
+                else:
+                    new_state[key] = s_mt           # deletion_sync off → conserver
+            else:
+                # Nouveau fichier NAS, ou local présent mais filtré
+                to_local.append(key)
+
+        else:
+            # Ni local ni NAS dans le scan — clé en state uniquement
+            lp = local_path(key)
+            np = nas_path(key)
+            l_exists = lp.exists()
+            n_exists = np.exists()
+            if not l_exists and not n_exists:
+                append_event("supprimé partout", key)
+            elif not l_exists and n_exists and cfg.get("deletion_sync", False):
+                del_from_nas.append(key)
+            elif l_exists and not n_exists and cfg.get("deletion_sync", False):
+                del_from_local.append(key)
+            else:
+                new_state[key] = state[key]         # filtré (âge/motif) ou deletion_sync off
 
     # ── filtrage par quota de taille (max_size_mb) ───────────────────────────
     # Pour chaque dossier avec max_size_mb > 0, seuls les fichiers NAS les plus

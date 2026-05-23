@@ -480,7 +480,7 @@ class SettingsWindow(Gtk.Window):
         lbl_bk.set_xalign(0)
         vbox.pack_start(lbl_bk, False, False, 0)
 
-        self._chk_backup = Gtk.CheckButton(label="Sauvegarder les fichiers avant de les écraser (~/.nas_sync_backups/)")
+        self._chk_backup = Gtk.CheckButton(label="Sauvegarder les fichiers avant de les écraser (~/.local/share/nas_sync/backups/)")
         self._chk_backup.set_active(self._cfg.get("backup_before_overwrite", True))
         vbox.pack_start(self._chk_backup, False, False, 0)
 
@@ -675,7 +675,7 @@ class SettingsWindow(Gtk.Window):
             "<small><b>Montage persistant (une seule fois, en administrateur) :</b>\n"
             "<tt>//HÔTE/PARTAGE  /POINT_MONTAGE  cifs  "
             "credentials=/home/USER/.smbcredentials,"
-            "uid=UID,nofail,_netdev,vers=3.0  0 0</tt>\n"
+            "uid=UID,nofail,_netdev,x-systemd.automount,x-systemd.mount-timeout=5,x-systemd.idle-timeout=60,user,vers=3.0  0 0</tt>\n"
             "Puis : <tt>sudo systemctl daemon-reload &amp;&amp; sudo mount -a</tt></small>"
         )
         fstab_lbl.set_xalign(0)

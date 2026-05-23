@@ -6,6 +6,7 @@ Lancé automatiquement si aucune configuration n'existe.
 """
 
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -261,7 +262,7 @@ class SetupWizard(Gtk.Assistant):
             f"chmod 600 ~/.smbcredentials\n\n"
             f"# 2. Ajouter dans /etc/fstab (une ligne) :\n"
             f"//{host or 'NAS_HOST'}/{share or 'SHARE'} {mount or '~/NasShare'} "
-            f"cifs credentials=~/.smbcredentials,uid=$(id -u),nofail,_netdev,vers=3.0 0 0\n\n"
+            f"cifs credentials=~/.smbcredentials,uid=$(id -u),nofail,_netdev,x-systemd.automount,x-systemd.mount-timeout=5,x-systemd.idle-timeout=60,user,vers=3.0 0 0\n\n"
             f"# 3. Monter :\n"
             f"sudo systemctl daemon-reload && sudo mount -a"
         )
@@ -322,7 +323,10 @@ class SetupWizard(Gtk.Assistant):
             "Le filtre par âge évite de dupliquer des années de fichiers volumineux."
         ), False, False, 0)
 
-        self._dir_rows = []
+        self._dir_rows       = []
+        self._dir_size_labels = []
+        self._nas_dir_sizes  = {}  # local_sub → octets (rempli après scan NAS)
+
         # (label, local_sub, nas_sub, enabled, max_age_days, max_size_mb)
         defaults = [
             ("Bureau",          "Desktop",   "Desktop",   True,  0,   0),
@@ -340,7 +344,7 @@ class SetupWizard(Gtk.Assistant):
 
         for col, (h, w) in enumerate([
             ("", 30), ("Dossier", 150), ("NAS", 120),
-            ("Âge max (j, 0=∞)", 130), ("Taille max (Mo, 0=∞)", 150),
+            ("Âge max (j, 0=∞)", 130), ("Taille max (Mo, 0=∞)", 150), ("Sur le NAS", 100),
         ]):
             lbl = Gtk.Label()
             lbl.set_markup(f"<b>{h}</b>")
@@ -351,6 +355,7 @@ class SetupWizard(Gtk.Assistant):
         for row, (label, local_sub, nas_sub, enabled, max_age, max_size) in enumerate(defaults, 1):
             chk = Gtk.CheckButton(label=label)
             chk.set_active(enabled)
+            chk.connect("toggled", lambda *_: GLib.idle_add(self._update_disk_banner))
 
             e_local = Gtk.Entry(); e_local.set_text(local_sub); e_local.set_width_chars(13)
             e_nas   = Gtk.Entry(); e_nas.set_text(nas_sub);     e_nas.set_width_chars(11)
@@ -364,19 +369,178 @@ class SetupWizard(Gtk.Assistant):
             spin_size.set_numeric(True)
             spin_size.set_width_chars(8)
 
+            size_lbl = Gtk.Label(label="—")
+            size_lbl.set_xalign(0)
+            size_lbl.set_width_chars(9)
+
             grid.attach(chk,       0, row, 1, 1)
             grid.attach(e_local,   1, row, 1, 1)
             grid.attach(e_nas,     2, row, 1, 1)
             grid.attach(spin_age,  3, row, 1, 1)
             grid.attach(spin_size, 4, row, 1, 1)
+            grid.attach(size_lbl,  5, row, 1, 1)
             self._dir_rows.append((chk, e_local, e_nas, spin_age, spin_size))
+            self._dir_size_labels.append(size_lbl)
 
         sw = Gtk.ScrolledWindow()
         sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        sw.set_min_content_height(280)
+        sw.set_min_content_height(240)
         sw.add(grid)
         vbox.pack_start(sw, True, True, 0)
+
+        vbox.pack_start(Gtk.Separator(), False, False, 2)
+
+        # Bannière espace disque / recommandation
+        self._disk_banner = Gtk.Label()
+        self._disk_banner.set_markup(
+            "<small><i>Connectez-vous au NAS (page précédente) pour afficher les tailles réelles.</i></small>"
+        )
+        self._disk_banner.set_xalign(0)
+        self._disk_banner.set_line_wrap(True)
+        vbox.pack_start(self._disk_banner, False, False, 0)
+
+        self._btn_recommend = Gtk.Button(label="Appliquer les limites suggérées")
+        self._btn_recommend.connect("clicked", self._apply_recommendations)
+        self._btn_recommend.set_sensitive(False)
+        self._btn_recommend.set_halign(Gtk.Align.START)
+        vbox.pack_start(self._btn_recommend, False, False, 4)
+
         return vbox
+
+    # ── Scan NAS et recommandations ───────────────────────────────────────────
+
+    @staticmethod
+    def _fmt_size(n: int) -> str:
+        if n >= 1_073_741_824:
+            return f"{n / 1_073_741_824:.1f} Go"
+        if n >= 1_048_576:
+            return f"{n / 1_048_576:.0f} Mo"
+        if n >= 1024:
+            return f"{n / 1024:.0f} Ko"
+        return f"{n} o"
+
+    def _scan_nas_sizes_async(self):
+        """Lance le scan des tailles des dossiers NAS dans un thread de fond."""
+        mount = self._wiz_entries["nas_mount"].get_text().strip()
+        for lbl in self._dir_size_labels:
+            lbl.set_markup("<small><i>…</i></small>")
+        self._disk_banner.set_markup("<small><i>Calcul des tailles en cours…</i></small>")
+        self._btn_recommend.set_sensitive(False)
+
+        rows_snapshot = [
+            (e_local.get_text().strip(), e_nas.get_text().strip())
+            for _, e_local, e_nas, _, _ in self._dir_rows
+        ]
+
+        def do_scan():
+            mount_path = Path(mount)
+            if not mount_path.is_mount():
+                GLib.idle_add(self._on_scan_done, {})
+                return
+            sizes = {}
+            for local_sub, nas_sub in rows_snapshot:
+                nas_dir = mount_path / nas_sub
+                if nas_dir.is_dir():
+                    try:
+                        r = subprocess.run(
+                            ["du", "-sb", str(nas_dir)],
+                            capture_output=True, text=True, timeout=60,
+                        )
+                        sizes[local_sub] = int(r.stdout.split()[0]) if r.returncode == 0 else 0
+                    except Exception:
+                        sizes[local_sub] = 0
+                else:
+                    sizes[local_sub] = 0
+            GLib.idle_add(self._on_scan_done, sizes)
+
+        threading.Thread(target=do_scan, daemon=True).start()
+        return False
+
+    def _on_scan_done(self, sizes: dict):
+        self._nas_dir_sizes = sizes
+        for i, (_, e_local, _, _, _) in enumerate(self._dir_rows):
+            sz = sizes.get(e_local.get_text().strip())
+            if sz is None:
+                self._dir_size_labels[i].set_text("—")
+            elif sz == 0:
+                self._dir_size_labels[i].set_markup("<small>vide</small>")
+            else:
+                self._dir_size_labels[i].set_markup(f"<small>{self._fmt_size(sz)}</small>")
+        self._update_disk_banner()
+
+    def _update_disk_banner(self):
+        """Recalcule et affiche le bilan espace disque / recommandation."""
+        if not self._nas_dir_sizes:
+            return
+
+        local_base = Path(DEFAULT_CONFIG["local_base"])
+        if not local_base.exists():
+            local_base = Path.home()
+        try:
+            avail = shutil.disk_usage(str(local_base)).free
+        except Exception:
+            avail = 0
+
+        selected_total = sum(
+            self._nas_dir_sizes.get(e_local.get_text().strip(), 0)
+            for chk, e_local, _, _, _ in self._dir_rows
+            if chk.get_active()
+        )
+
+        avail_s    = self._fmt_size(avail)
+        selected_s = self._fmt_size(selected_total)
+
+        if selected_total == 0:
+            self._disk_banner.set_markup(
+                f"<small>Disque libre : <b>{avail_s}</b> | Sélection NAS : —</small>"
+            )
+            self._btn_recommend.set_sensitive(False)
+            return
+
+        if selected_total <= avail * 0.85:
+            self._disk_banner.set_markup(
+                f'<small>Disque libre : <b>{avail_s}</b> | Sélection NAS : <b>{selected_s}</b> '
+                f'<span foreground="green">✓ Tout rentre — aucune limite nécessaire</span></small>'
+            )
+        else:
+            manque = self._fmt_size(selected_total - int(avail * 0.85))
+            self._disk_banner.set_markup(
+                f'<small>Disque libre : <b>{avail_s}</b> | Sélection NAS : <b>{selected_s}</b> '
+                f'<span foreground="orange">⚠ Manque ~{manque} — appliquez les limites suggérées '
+                f'ou désactivez des dossiers volumineux</span></small>'
+            )
+        self._btn_recommend.set_sensitive(True)
+
+    def _apply_recommendations(self, _=None):
+        """Remplit les spin_size avec des quotas proportionnels à l'espace disponible."""
+        local_base = Path(DEFAULT_CONFIG["local_base"])
+        if not local_base.exists():
+            local_base = Path.home()
+        try:
+            avail = shutil.disk_usage(str(local_base)).free
+        except Exception:
+            return
+
+        budget = int(avail * 0.85)
+        selected = [
+            (spin_size, self._nas_dir_sizes.get(e_local.get_text().strip(), 0))
+            for chk, e_local, _, _, spin_size in self._dir_rows
+            if chk.get_active()
+        ]
+        if not selected:
+            return
+
+        total_nas = sum(sz for _, sz in selected)
+
+        if total_nas == 0 or total_nas <= budget:
+            for spin, _ in selected:
+                spin.set_value(0)   # 0 = illimité, tout rentre
+        else:
+            for spin, sz in selected:
+                quota_mb = max(1, int(sz / total_nas * budget) // 1_048_576) if sz > 0 else 0
+                spin.set_value(quota_mb)
+
+        self._update_disk_banner()
 
     # ── Page 3 : Options ──────────────────────────────────────────────────────
 
@@ -467,7 +631,9 @@ class SetupWizard(Gtk.Assistant):
 
     def _on_prepare(self, assistant, page):
         """Déclenché quand on arrive sur une page."""
-        if page is self._p_install:
+        if page is self._p_dossiers:
+            GLib.idle_add(self._scan_nas_sizes_async)
+        elif page is self._p_install:
             GLib.idle_add(self._run_install)
 
     def _log(self, msg: str):
@@ -566,13 +732,22 @@ class SetupWizard(Gtk.Assistant):
                     if link.is_symlink():
                         link.unlink()
                     elif link.is_dir():
+                        # Déplacer le contenu vers la cible avant de supprimer le dossier
                         try:
+                            for item in list(link.iterdir()):
+                                dest = target / item.name
+                                if not dest.exists():
+                                    shutil.move(str(item), str(dest))
+                                    log(f"  ↳ déplacé : {item.name} → {target}")
                             link.rmdir()
-                        except OSError:
-                            pass
+                        except OSError as exc:
+                            log(f"  ✗ ~/{name} impossible à libérer : {exc}")
+                            log(f"    Déplacez manuellement son contenu vers {target}")
                     if not link.exists():
                         link.symlink_to(target)
                         log(f"  ✓ ~/{name} → {target}")
+                    elif not link.is_symlink():
+                        log(f"  ✗ ~/{name} : dossier non vide — lien non créé")
             prog(0.55)
 
             # ── 5. XDG user-dirs ─────────────────────────────────────────────
