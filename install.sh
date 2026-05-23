@@ -407,6 +407,16 @@ else
 
         [ -d "$src" ] || { warn "Dossier '$fr_name' absent sur le NAS — ignoré"; continue; }
 
+        # Vérifier ce qui est déjà présent dans le cache local
+        local_count=0
+        local_bytes_cached=0
+        if [ -d "$dst" ] && [ -n "$(ls -A "$dst" 2>/dev/null)" ]; then
+            local_count=$(find "$dst" -type f 2>/dev/null | wc -l)
+            local_bytes_cached=$(du -sb "$dst" 2>/dev/null | awk '{print $1}')
+            local_bytes_cached=${local_bytes_cached:-0}
+            dim "→ $local_count fichier(s) déjà en cache ($(fmt_bytes $local_bytes_cached)) — seuls les fichiers manquants ou modifiés sur le NAS seront téléchargés"
+        fi
+
         # Taille effective (avec quota si défini)
         files_from_tmp=""
         if [ "$quota_go" -gt 0 ]; then
@@ -435,7 +445,7 @@ else
         fi
 
         echo -e "  ${BOLD}${CYAN}»${NC} Synchronisation de : ${BOLD}$fr_name${NC} ($size_label)"
-        rsync -ah --ignore-existing --info=progress2 $rsync_extra_args \
+        rsync -ah --info=progress2 $rsync_extra_args \
             "$src/" "$dst/" 2>/dev/null | \
             awk -v fr="$fr_name" -v RS='\r' '
             {
